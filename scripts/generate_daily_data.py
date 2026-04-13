@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import math
 import re
 import shutil
 import subprocess
@@ -16,6 +17,12 @@ import requests
 
 CSV_ENCODINGS = ("utf-8-sig", "utf-8", "gb18030", "gbk")
 DECIMAL_PLACES = 6
+RATE_DECIMAL_PLACES = 4
+RETURN_HISTORY_VALUE_DECIMAL_PLACES = 1
+NAV_DECIMAL_PLACES = 4
+RETURN_HISTORY_HEADER = ["date", "assets_total", "cost_total", "return_history"]
+XIRR_HISTORY_HEADER = ["date", "assets_total", "xirr"]
+NAV_HISTORY_HEADER = ["date", "assets_total", "cost_total", "fund_share", "fund_nav"]
 
 
 @dataclass
@@ -29,6 +36,22 @@ class HoldingRow:
     product_variable: str
     assets_variable: str
     industry_variable: str
+
+
+@dataclass
+class CashRow:
+    line_no: int
+    account_name: str
+    amount_raw: str
+
+
+@dataclass
+class CashflowEntry:
+    line_no: int
+    date_text: str
+    date_value: dt.date
+    amount: float
+    note: str
 
 
 def read_csv_rows(csv_path: Path) -> Tuple[List[List[str]], str]:
@@ -97,8 +120,39 @@ def parse_number(value: str) -> float:
     return float(match.group(0))
 
 
+def parse_flexible_date(value: str) -> dt.date:
+    text = value.strip()
+    if not text:
+        raise ValueError("date is empty")
+    try:
+        return dt.date.fromisoformat(text)
+    except ValueError:
+        pass
+
+    match = re.fullmatch(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})", text)
+    if not match:
+        raise ValueError(f"invalid date '{value}'")
+
+    year = int(match.group(1))
+    month = int(match.group(2))
+    day = int(match.group(3))
+    return dt.date(year, month, day)
+
+
 def round6(value: float) -> float:
     return round(float(value), DECIMAL_PLACES)
+
+
+def round1(value: float) -> float:
+    return round(float(value), RETURN_HISTORY_VALUE_DECIMAL_PLACES)
+
+
+def round4(value: float) -> float:
+    return round(float(value), NAV_DECIMAL_PLACES)
+
+
+def round_rate(value: float) -> float:
+    return round(float(value), RATE_DECIMAL_PLACES)
 
 
 def extract_decimal_candidates(text: str, pattern: str) -> List[float]:
@@ -277,6 +331,396 @@ def load_holdings(csv_path: Path) -> Tuple[List[HoldingRow], str]:
             )
         )
     return holdings, encoding
+
+
+def load_cash_positions(csv_path: Path) -> Tuple[List[CashRow], float, str]:
+    rows, encoding = read_csv_rows(csv_path)
+    cash_rows: List[CashRow] = []
+    cash_total = 0.0
+
+    for index, raw_row in enumerate(rows[1:], start=2):
+        row = (raw_row + [""] * 2)[:2]
+        row = [cell.strip() for cell in row]
+        if not any(row):
+            continue
+
+        account_name = row[0]
+        amount_raw = row[1]
+        if not account_name:
+            raise ValueError(f"line {index}: cash account name is empty")
+        if not amount_raw:
+            raise ValueError(f"line {index}: cash amount is empty")
+
+        amount = round6(float(amount_raw))
+        cash_total += amount
+        cash_rows.append(
+            CashRow(
+                line_no=index,
+                account_name=account_name,
+                amount_raw=amount_raw,
+            )
+        )
+
+    return cash_rows, round6(cash_total), encoding
+
+
+def load_cashflow_entries(csv_path: Path) -> Tuple[List[CashflowEntry], str]:
+    rows, encoding = read_csv_rows(csv_path)
+    entries: List[CashflowEntry] = []
+
+    for index, raw_row in enumerate(rows[1:], start=2):
+        row = (raw_row + [""] * 3)[:3]
+        row = [cell.strip() for cell in row]
+        if not any(row):
+            continue
+
+        date_raw = row[0]
+        amount_raw = row[1]
+        note = row[2]
+        if not date_raw:
+            raise ValueError(f"line {index}: cashflow date is empty")
+        if not amount_raw:
+            raise ValueError(f"line {index}: cashflow amount is empty")
+        date_value = parse_flexible_date(date_raw)
+
+        entries.append(
+            CashflowEntry(
+                line_no=index,
+                date_text=date_value.isoformat(),
+                date_value=date_value,
+                amount=round6(float(amount_raw)),
+                note=note,
+            )
+        )
+
+    entries.sort(key=lambda item: item.date_value)
+    return entries, encoding
+
+
+def compute_cost_total(cashflow_entries: List[CashflowEntry]) -> float:
+    cost_total = 0.0
+    for entry in cashflow_entries:
+        if entry.amount < 0:
+            cost_total += -entry.amount
+    return round6(cost_total)
+
+
+def _xnpv(rate: float, cashflows: List[Tuple[dt.date, float]]) -> float:
+    if rate <= -0.999999999:
+        return float("inf")
+    base_date = cashflows[0][0]
+    result = 0.0
+    for flow_date, amount in cashflows:
+        years = (flow_date - base_date).days / 365.0
+        try:
+            result += amount / ((1.0 + rate) ** years)
+        except OverflowError:
+            # Very large positive rates make denominator effectively infinite.
+            continue
+    return result
+
+
+def compute_xirr(
+    cashflow_entries: List[CashflowEntry],
+    valuation_date: dt.date,
+    assets_total: float,
+) -> float | None:
+    if assets_total <= 0:
+        return None
+
+    cashflows: List[Tuple[dt.date, float]] = [
+        (entry.date_value, entry.amount)
+        for entry in cashflow_entries
+        if entry.date_value <= valuation_date and entry.amount != 0
+    ]
+    cashflows.append((valuation_date, assets_total))
+
+    has_negative = any(amount < 0 for _, amount in cashflows)
+    has_positive = any(amount > 0 for _, amount in cashflows)
+    if not (has_negative and has_positive):
+        return None
+
+    low = -0.999999
+    high = 1.0
+    f_low = _xnpv(low, cashflows)
+    f_high = _xnpv(high, cashflows)
+    if not math.isfinite(f_low):
+        low = -0.99
+        f_low = _xnpv(low, cashflows)
+    if not math.isfinite(f_low) or not math.isfinite(f_high):
+        return None
+
+    expand_count = 0
+    while f_low * f_high > 0 and expand_count < 60:
+        high *= 2.0
+        f_high = _xnpv(high, cashflows)
+        expand_count += 1
+
+    if f_low * f_high > 0:
+        return None
+
+    for _ in range(200):
+        mid = (low + high) / 2.0
+        f_mid = _xnpv(mid, cashflows)
+        if not math.isfinite(f_mid):
+            return None
+        if abs(f_mid) < 1e-10:
+            return mid
+        if f_low * f_mid <= 0:
+            high = mid
+            f_high = f_mid
+        else:
+            low = mid
+            f_low = f_mid
+
+    return (low + high) / 2.0
+
+
+def _parse_date_sort_key(value: str) -> Tuple[int, str]:
+    text = value.strip()
+    try:
+        return (0, parse_flexible_date(text).isoformat())
+    except ValueError:
+        return (1, text)
+
+
+def _normalize_existing_return_history_rows(rows: List[List[str]]) -> Dict[str, List[object]]:
+    if not rows:
+        return {}
+
+    header = [cell.strip() for cell in rows[0]]
+    try:
+        date_idx = header.index("date")
+        assets_idx = header.index("assets_total")
+        cost_idx = header.index("cost_total")
+    except ValueError:
+        return {}
+
+    records: Dict[str, List[object]] = {}
+    for row in rows[1:]:
+        if not any(cell.strip() for cell in row):
+            continue
+        date_text = row[date_idx].strip() if date_idx < len(row) else ""
+        if not date_text:
+            continue
+
+        assets_value = ""
+        cost_value = ""
+        return_value: float | str = ""
+        if assets_idx < len(row) and row[assets_idx].strip():
+            assets_value = round1(parse_number(row[assets_idx]))
+        if cost_idx < len(row) and row[cost_idx].strip():
+            cost_value = round1(parse_number(row[cost_idx]))
+        if assets_value != "" and cost_value != "" and float(cost_value) > 0:
+            return_value = round_rate(float(assets_value) / float(cost_value) - 1.0)
+
+        records[date_text] = [date_text, assets_value, cost_value, return_value]
+
+    return records
+
+
+def upsert_return_history(
+    return_history_csv: Path,
+    date_text: str,
+    assets_total: float,
+    cost_total: float,
+) -> None:
+    records: Dict[str, List[object]] = {}
+    if return_history_csv.exists():
+        rows, _ = read_csv_rows(return_history_csv)
+        records = _normalize_existing_return_history_rows(rows)
+
+    return_history: float | str = ""
+    if cost_total > 0:
+        return_history = round_rate(assets_total / cost_total - 1.0)
+
+    records[date_text] = [
+        date_text,
+        round1(assets_total),
+        round1(cost_total),
+        return_history,
+    ]
+
+    sorted_dates = sorted(records.keys(), key=_parse_date_sort_key)
+    output_rows: List[List[object]] = [RETURN_HISTORY_HEADER]
+    for date_key in sorted_dates:
+        output_rows.append(records[date_key])
+
+    write_csv_rows(return_history_csv, output_rows)
+
+
+def _normalize_existing_xirr_history_rows(rows: List[List[str]]) -> Dict[str, List[object]]:
+    if not rows:
+        return {}
+
+    header = [cell.strip() for cell in rows[0]]
+    try:
+        date_idx = header.index("date")
+    except ValueError:
+        return {}
+
+    assets_idx = header.index("assets_total") if "assets_total" in header else -1
+    xirr_idx = header.index("xirr") if "xirr" in header else -1
+    if xirr_idx < 0 and "xirr_rate" in header:
+        xirr_idx = header.index("xirr_rate")
+
+    records: Dict[str, List[object]] = {}
+    for row in rows[1:]:
+        if not any(cell.strip() for cell in row):
+            continue
+        date_text = row[date_idx].strip() if date_idx < len(row) else ""
+        if not date_text:
+            continue
+
+        assets_value: float | str = ""
+        xirr_value: float | str = ""
+        if assets_idx >= 0 and assets_idx < len(row) and row[assets_idx].strip():
+            assets_value = round1(parse_number(row[assets_idx]))
+        if xirr_idx >= 0 and xirr_idx < len(row) and row[xirr_idx].strip():
+            xirr_value = round_rate(parse_number(row[xirr_idx]))
+        records[date_text] = [date_text, assets_value, xirr_value]
+
+    return records
+
+
+def upsert_xirr_history(
+    xirr_history_csv: Path,
+    date_text: str,
+    assets_total: float,
+    xirr_value: float | None,
+) -> None:
+    records: Dict[str, List[object]] = {}
+    if xirr_history_csv.exists():
+        rows, _ = read_csv_rows(xirr_history_csv)
+        records = _normalize_existing_xirr_history_rows(rows)
+
+    records[date_text] = [
+        date_text,
+        round1(assets_total),
+        round_rate(xirr_value) if xirr_value is not None else "",
+    ]
+
+    sorted_dates = sorted(records.keys(), key=_parse_date_sort_key)
+    output_rows: List[List[object]] = [XIRR_HISTORY_HEADER]
+    for date_key in sorted_dates:
+        output_rows.append(records[date_key])
+
+    write_csv_rows(xirr_history_csv, output_rows)
+
+
+def _normalize_existing_nav_history_rows(rows: List[List[str]]) -> Dict[str, List[object]]:
+    if not rows:
+        return {}
+
+    header = [cell.strip() for cell in rows[0]]
+    required = {"date", "assets_total", "cost_total", "fund_share", "fund_nav"}
+    if not required.issubset(set(header)):
+        return {}
+
+    date_idx = header.index("date")
+    assets_idx = header.index("assets_total")
+    cost_idx = header.index("cost_total")
+    share_idx = header.index("fund_share")
+    nav_idx = header.index("fund_nav")
+
+    records: Dict[str, List[object]] = {}
+    for row in rows[1:]:
+        if not any(cell.strip() for cell in row):
+            continue
+        date_text = row[date_idx].strip() if date_idx < len(row) else ""
+        if not date_text:
+            continue
+
+        assets_value: float | str = ""
+        cost_value: float | str = ""
+        share_value: float | str = ""
+        nav_value: float | str = ""
+
+        if assets_idx < len(row) and row[assets_idx].strip():
+            assets_value = round1(parse_number(row[assets_idx]))
+        if cost_idx < len(row) and row[cost_idx].strip():
+            cost_value = round1(parse_number(row[cost_idx]))
+        if share_idx < len(row) and row[share_idx].strip():
+            share_value = round4(parse_number(row[share_idx]))
+        if nav_idx < len(row) and row[nav_idx].strip():
+            nav_value = round4(parse_number(row[nav_idx]))
+
+        records[date_text] = [date_text, assets_value, cost_value, share_value, nav_value]
+
+    return records
+
+
+def _find_previous_nav_record(
+    records: Dict[str, List[object]],
+    target_date: dt.date,
+) -> List[object] | None:
+    candidates: List[Tuple[dt.date, List[object]]] = []
+    for date_text, record in records.items():
+        try:
+            date_value = parse_flexible_date(date_text)
+        except ValueError:
+            continue
+        if date_value < target_date:
+            candidates.append((date_value, record))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0])
+    return candidates[-1][1]
+
+
+def upsert_nav_history(
+    nav_history_csv: Path,
+    date_text: str,
+    assets_total: float,
+    cost_total: float,
+) -> None:
+    records: Dict[str, List[object]] = {}
+    if nav_history_csv.exists():
+        rows, _ = read_csv_rows(nav_history_csv)
+        records = _normalize_existing_nav_history_rows(rows)
+
+    today_date = parse_flexible_date(date_text)
+    previous_record = _find_previous_nav_record(records, today_date)
+
+    # First record baseline: nav=1, share=integer assets_total.
+    if previous_record is None:
+        fund_share = float(int(assets_total))
+        if fund_share <= 0:
+            fund_share = round4(assets_total)
+        fund_nav = 1.0
+    else:
+        prev_cost_total = float(previous_record[2]) if previous_record[2] != "" else 0.0
+        prev_fund_share = float(previous_record[3]) if previous_record[3] != "" else 0.0
+        prev_fund_nav = float(previous_record[4]) if previous_record[4] != "" else 0.0
+        if prev_fund_share <= 0 or prev_fund_nav <= 0:
+            raise ValueError("Invalid previous nav_history row: fund_share/fund_nav must be positive")
+
+        cost_change = cost_total - prev_cost_total
+        if abs(cost_change) < 1e-9:
+            fund_share = prev_fund_share
+        elif cost_change > 0:
+            fund_share = prev_fund_share + (cost_change / prev_fund_nav)
+        else:
+            fund_share = prev_fund_share - ((-cost_change) / prev_fund_nav)
+
+        if fund_share <= 0:
+            raise ValueError("Computed fund_share <= 0, check cashflows/cost_total history consistency")
+        fund_nav = assets_total / fund_share
+
+    records[date_text] = [
+        date_text,
+        round1(assets_total),
+        round1(cost_total),
+        round4(fund_share),
+        round4(fund_nav),
+    ]
+
+    sorted_dates = sorted(records.keys(), key=_parse_date_sort_key)
+    output_rows: List[List[object]] = [NAV_HISTORY_HEADER]
+    for date_key in sorted_dates:
+        output_rows.append(records[date_key])
+
+    write_csv_rows(nav_history_csv, output_rows)
 
 
 class PriceFetcher:
@@ -465,6 +909,11 @@ class PriceFetcher:
 
 def generate_daily_data(
     holdings_csv: Path,
+    current_cash_csv: Path,
+    cashflows_csv: Path,
+    return_history_csv: Path,
+    xirr_history_csv: Path,
+    nav_history_csv: Path,
     product_ref_csv: Path,
     assets_ref_csv: Path,
     industry_ref_csv: Path,
@@ -473,12 +922,17 @@ def generate_daily_data(
     timeout: float,
 ) -> int:
     holdings, holdings_encoding = load_holdings(holdings_csv)
+    cash_rows, cash_total, cash_encoding = load_cash_positions(current_cash_csv)
+    cashflow_entries, cashflows_encoding = load_cashflow_entries(cashflows_csv)
+    cost_total = compute_cost_total(cashflow_entries)
+    cashflow_count = len(cashflow_entries)
     product_map = load_variable_mapping(product_ref_csv)
     assets_map = load_variable_mapping(assets_ref_csv)
     industry_map = load_variable_mapping(industry_ref_csv)
 
     fetcher = PriceFetcher(timeout=timeout)
-    today = dt.date.today().isoformat()
+    today_date = dt.date.today()
+    today = today_date.isoformat()
 
     header = [
         "date",
@@ -505,7 +959,6 @@ def generate_daily_data(
     success_count = 0
     error_count = 0
     total_value = 0.0
-    total_cost = 0.0
 
     for holding in holdings:
         product_code = normalize_code(holding.product_variable)
@@ -535,11 +988,8 @@ def generate_daily_data(
             target_price_val = round6(target_price_val)
             target_value = round6(target_amount * target_price_val)
             target_pnl = round6(target_value - target_cost)
-            target_return_rate = (
-                round6((target_value / target_cost - 1.0) * 100.0) if target_cost else None
-            )
+            target_return_rate = round_rate(target_value / target_cost - 1.0) if target_cost else None
             total_value += target_value
-            total_cost += target_cost
             success_count += 1
         except Exception as exc:
             fetch_status = "error"
@@ -571,11 +1021,37 @@ def generate_daily_data(
             ]
         )
 
-    total_cost_rounded = round6(total_cost) if success_count else ""
-    total_value_rounded = round6(total_value) if success_count else ""
-    total_pnl_rounded = round6(total_value - total_cost) if success_count else ""
+    # Add synthetic cash_total row from current_cash.csv.
+    output_rows.append(
+        [
+            today,
+            "cash_total",
+            "CASH",
+            1,
+            cash_total,
+            1,
+            cash_total,
+            0,
+            0,
+            "",
+            "",
+            "现金",
+            "",
+            "现金",
+            "",
+            "",
+            "ok",
+            f"cash_accounts={len(cash_rows)}",
+        ]
+    )
+    total_value += cash_total
+
+    has_total_data = success_count > 0 or cash_total > 0 or cost_total > 0
+    total_cost_rounded = cost_total if has_total_data else ""
+    total_value_rounded = round6(total_value) if has_total_data else ""
+    total_pnl_rounded = round6(total_value - cost_total) if has_total_data else ""
     total_return_rate_rounded = (
-        round6((total_value / total_cost - 1.0) * 100.0) if success_count and total_cost else ""
+        round_rate(total_value / cost_total - 1.0) if has_total_data and cost_total else ""
     )
 
     output_rows.append(
@@ -597,11 +1073,37 @@ def generate_daily_data(
             "",
             "",
             "summary",
-            f"holdings_encoding={holdings_encoding}; success={success_count}; error={error_count}",
+            (
+                f"holdings_encoding={holdings_encoding}; cash_encoding={cash_encoding}; "
+                f"cashflows_encoding={cashflows_encoding}; cash_total={cash_total}; "
+                f"cost_total={cost_total}; cashflow_count={cashflow_count}; "
+                f"success={success_count}; error={error_count}"
+            ),
         ]
     )
 
     write_csv_rows(output_csv, output_rows)
+    if has_total_data:
+        assets_total_rounded = round6(total_value)
+        upsert_return_history(
+            return_history_csv=return_history_csv,
+            date_text=today,
+            assets_total=assets_total_rounded,
+            cost_total=round6(cost_total),
+        )
+        xirr_value = compute_xirr(cashflow_entries, today_date, assets_total_rounded)
+        upsert_xirr_history(
+            xirr_history_csv=xirr_history_csv,
+            date_text=today,
+            assets_total=assets_total_rounded,
+            xirr_value=xirr_value,
+        )
+        upsert_nav_history(
+            nav_history_csv=nav_history_csv,
+            date_text=today,
+            assets_total=assets_total_rounded,
+            cost_total=round6(cost_total),
+        )
 
     if archive_dir is not None:
         archive_dir.mkdir(parents=True, exist_ok=True)
@@ -623,6 +1125,36 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("data/input/current_holdings.csv"),
         help="Path to current_holdings.csv",
+    )
+    parser.add_argument(
+        "--current-cash",
+        type=Path,
+        default=Path("data/input/current_cash.csv"),
+        help="Path to current_cash.csv",
+    )
+    parser.add_argument(
+        "--cashflows",
+        type=Path,
+        default=Path("data/input/cashflows.csv"),
+        help="Path to cashflows.csv",
+    )
+    parser.add_argument(
+        "--return-history",
+        type=Path,
+        default=Path("data/output/return_history.csv"),
+        help="Path to return_history.csv",
+    )
+    parser.add_argument(
+        "--xirr-history",
+        type=Path,
+        default=Path("data/output/xirr_history.csv"),
+        help="Path to xirr_history.csv",
+    )
+    parser.add_argument(
+        "--nav-history",
+        type=Path,
+        default=Path("data/output/nav_history.csv"),
+        help="Path to nav_history.csv",
     )
     parser.add_argument(
         "--product-ref",
@@ -698,6 +1230,11 @@ def run_playwright_node(node_bin: str, playwright_script: Path) -> int:
 def run_python_engine(args: argparse.Namespace, archive_dir: Path | None) -> int:
     return generate_daily_data(
         holdings_csv=args.holdings,
+        current_cash_csv=args.current_cash,
+        cashflows_csv=args.cashflows,
+        return_history_csv=args.return_history,
+        xirr_history_csv=args.xirr_history,
+        nav_history_csv=args.nav_history,
         product_ref_csv=args.product_ref,
         assets_ref_csv=args.assets_ref,
         industry_ref_csv=args.industry_ref,
