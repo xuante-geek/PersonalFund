@@ -5,6 +5,7 @@ import argparse
 import csv
 import datetime as dt
 import math
+import platform
 import re
 import shutil
 import subprocess
@@ -173,19 +174,30 @@ def normalize_code(value: str) -> str:
     return text
 
 
-def looks_like_target_code(value: str) -> bool:
+def normalize_target_code(value: str) -> str:
     text = value.strip().lower()
     if not text:
+        return ""
+
+    match_with_prefix = re.fullmatch(r"(sh|sz|jj)(\d{1,6})", text)
+    if match_with_prefix:
+        return f"{match_with_prefix.group(1)}{match_with_prefix.group(2).zfill(6)}"
+
+    if re.fullmatch(r"\d{1,6}", text):
+        return text.zfill(6)
+
+    return text
+
+
+def looks_like_target_code(value: str) -> bool:
+    text = normalize_target_code(value)
+    if not text:
         return False
-    if re.fullmatch(r"\d{6}", text):
-        return True
-    if re.fullmatch(r"(sh|sz|jj)\d{6}", text):
-        return True
-    return False
+    return bool(re.fullmatch(r"(?:sh|sz|jj)?\d{6}", text))
 
 
 def extract_target_digits(value: str) -> str:
-    text = value.strip().lower()
+    text = normalize_target_code(value)
     match = re.fullmatch(r"(?:sh|sz|jj)?(\d{6})", text)
     if not match:
         return ""
@@ -233,6 +245,48 @@ def find_header_index(header: List[str], aliases: List[str]) -> int:
         if alias in header:
             return header.index(alias)
     return -1
+
+
+def _escape_applescript_text(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def notify_error_popup(title: str, message: str) -> None:
+    try:
+        system = platform.system()
+        if system == "Darwin":
+            script = (
+                f'display alert "{_escape_applescript_text(title)}" '
+                f'message "{_escape_applescript_text(message)}" as critical'
+            )
+            subprocess.run(
+                ["osascript", "-e", script],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+    except Exception:
+        # Never block main workflow because of notification failures.
+        return
+
+
+def notify_success_popup(title: str, message: str) -> None:
+    try:
+        system = platform.system()
+        if system == "Darwin":
+            script = (
+                f'display alert "{_escape_applescript_text(title)}" '
+                f'message "{_escape_applescript_text(message)}"'
+            )
+            subprocess.run(
+                ["osascript", "-e", script],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+    except Exception:
+        # Never block main workflow because of notification failures.
+        return
 
 
 def round6(value: float) -> float:
@@ -486,7 +540,8 @@ def load_holdings(csv_path: Path) -> Tuple[List[HoldingRow], str]:
             continue
         # Fixed format:
         # A-H: name,code,amount,cost,url,product,assets,industry
-        target_code = row[1]
+        raw_target_code = row[1]
+        target_code = normalize_target_code(raw_target_code)
         if not looks_like_target_code(target_code):
             raise ValueError(f"line {index}: invalid target_code '{row[1]}'")
 
@@ -1661,6 +1716,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("scripts/generate_daily_data_playwright.mjs"),
         help="Node Playwright script path.",
     )
+    parser.add_argument(
+        "--notify-on-error",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Show system popup when script exits with non-zero code (default: true).",
+    )
+    parser.add_argument(
+        "--notify-on-success",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Show system popup when script exits successfully (default: true).",
+    )
     return parser
 
 
@@ -1701,28 +1768,41 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
+    rc = 0
     archive_dir: Path | None
     if str(args.archive_dir).strip() == "":
         archive_dir = None
     else:
         archive_dir = args.archive_dir
 
-    if args.engine == "python":
-        return run_python_engine(args, archive_dir)
-
-    if args.engine == "playwright-node":
-        return run_playwright_node(args.node_bin, args.playwright_script)
-
-    # auto mode: prefer Node Playwright; fallback to Python when Node is unavailable or execution fails.
     try:
-        node_rc = run_playwright_node(args.node_bin, args.playwright_script)
-        if node_rc == 0:
-            return 0
-        print(f"Playwright engine failed with exit code {node_rc}, fallback to Python engine.")
-        return run_python_engine(args, archive_dir)
-    except RuntimeError as exc:
-        print(f"Playwright engine unavailable, fallback to Python engine: {exc}")
-        return run_python_engine(args, archive_dir)
+        if args.engine == "python":
+            rc = run_python_engine(args, archive_dir)
+        elif args.engine == "playwright-node":
+            rc = run_playwright_node(args.node_bin, args.playwright_script)
+        else:
+            # auto mode: prefer Node Playwright; fallback to Python when Node is unavailable or execution fails.
+            try:
+                node_rc = run_playwright_node(args.node_bin, args.playwright_script)
+                if node_rc == 0:
+                    rc = 0
+                else:
+                    print(f"Playwright engine failed with exit code {node_rc}, fallback to Python engine.")
+                    rc = run_python_engine(args, archive_dir)
+            except RuntimeError as exc:
+                print(f"Playwright engine unavailable, fallback to Python engine: {exc}")
+                rc = run_python_engine(args, archive_dir)
+    except Exception:
+        if args.notify_on_error:
+            notify_error_popup("PersonalFund 运行失败", "程序异常退出，请查看终端报错日志。")
+        raise
+
+    if rc != 0 and args.notify_on_error:
+        notify_error_popup("PersonalFund 运行失败", f"程序退出码 {rc}，请查看终端报错日志。")
+    if rc == 0 and args.notify_on_success:
+        today_text = dt.datetime.now().strftime("%Y-%m-%d")
+        notify_success_popup("PersonalFund 运行成功", f"运行日期：{today_text}")
+    return rc
 
 
 if __name__ == "__main__":
