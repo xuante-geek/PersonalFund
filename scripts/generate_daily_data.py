@@ -4,7 +4,9 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import html
 import math
+import os
 import platform
 import re
 import shutil
@@ -12,7 +14,8 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Set, Tuple
+from urllib.parse import urlparse
 
 import requests
 
@@ -34,6 +37,8 @@ RETURN_HISTORY_HEADER = [COL_DATE, COL_ASSETS_TOTAL, COL_COST_TOTAL, COL_RETURN]
 XIRR_HISTORY_HEADER = [COL_DATE, COL_ASSETS_TOTAL, COL_XIRR]
 NAV_BASE_HEADER = [COL_DATE, COL_ASSETS_TOTAL, COL_COST_TOTAL, COL_FUND_SHARE, COL_FUND_NAV]
 BENCHMARK_BASE_DATE = dt.date(2026, 4, 13)
+SSE_CLOSED_ARRANGEMENT_URL = "https://www.sse.com.cn/disclosure/dealinstruc/closed/"
+DEFAULT_COS_ENDPOINT = "personalfund-data-1399092305.cos.ap-guangzhou.myqcloud.com"
 BENCHMARK_INDEXES = [
     {
         "key": "csi_all_a",
@@ -238,6 +243,426 @@ def parse_flexible_date(value: str) -> dt.date:
     month = int(match.group(2))
     day = int(match.group(3))
     return dt.date(year, month, day)
+
+
+def _parse_yes_no_flag(value: str) -> bool:
+    text = value.strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError(f"invalid boolean flag '{value}'")
+
+
+def load_trading_calendar(csv_path: Path) -> Dict[dt.date, bool]:
+    rows, _ = read_csv_rows(csv_path)
+    if not rows:
+        raise ValueError(f"trading calendar is empty: {csv_path}")
+
+    header = [cell.strip() for cell in rows[0]]
+    date_idx = find_header_index(header, ["date", "日期"])
+    trading_idx = find_header_index(header, ["is_trading_day", "交易日", "是否交易日"])
+    if date_idx < 0 or trading_idx < 0:
+        raise ValueError(f"trading calendar header invalid: {csv_path}")
+
+    calendar: Dict[dt.date, bool] = {}
+    for index, row in enumerate(rows[1:], start=2):
+        if not any(cell.strip() for cell in row):
+            continue
+        if date_idx >= len(row) or trading_idx >= len(row):
+            continue
+
+        date_raw = row[date_idx].strip()
+        trading_raw = row[trading_idx].strip()
+        if not date_raw or not trading_raw:
+            continue
+
+        try:
+            date_value = parse_flexible_date(date_raw)
+        except ValueError as exc:
+            raise ValueError(f"line {index}: invalid trading date '{date_raw}'") from exc
+        try:
+            is_trading_day = _parse_yes_no_flag(trading_raw)
+        except ValueError as exc:
+            raise ValueError(f"line {index}: invalid is_trading_day '{trading_raw}'") from exc
+
+        calendar[date_value] = is_trading_day
+    return calendar
+
+
+def find_previous_trading_day(today_date: dt.date, trading_calendar: Dict[dt.date, bool]) -> dt.date | None:
+    candidates = [date for date, is_open in trading_calendar.items() if is_open and date < today_date]
+    if not candidates:
+        return None
+    return max(candidates)
+
+
+def csv_has_date_record(csv_path: Path, target_date: dt.date) -> bool:
+    if not csv_path.exists():
+        return False
+    rows, _ = read_csv_rows(csv_path)
+    if not rows:
+        return False
+
+    header = [cell.strip() for cell in rows[0]]
+    date_idx = find_header_index(header, [COL_DATE, "date", "日期"])
+    if date_idx < 0:
+        return False
+
+    target_text = target_date.isoformat()
+    for row in rows[1:]:
+        if not any(cell.strip() for cell in row):
+            continue
+        if date_idx >= len(row):
+            continue
+        raw = row[date_idx].strip()
+        if not raw:
+            continue
+        if raw == target_text:
+            return True
+        try:
+            if parse_flexible_date(raw).isoformat() == target_text:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def find_missing_previous_day_records(
+    previous_trading_day: dt.date,
+    history_csv_paths: Dict[str, Path],
+) -> List[str]:
+    missing: List[str] = []
+    for alias, csv_path in history_csv_paths.items():
+        if not csv_has_date_record(csv_path, previous_trading_day):
+            missing.append(f"{alias}: {csv_path}")
+    return missing
+
+
+def _normalize_existing_trading_calendar_rows(rows: List[List[str]]) -> Dict[dt.date, Dict[str, str]]:
+    if not rows:
+        return {}
+    header = [cell.strip() for cell in rows[0]]
+    date_idx = find_header_index(header, ["date", "日期"])
+    trading_idx = find_header_index(header, ["is_trading_day", "交易日", "是否交易日"])
+    market_idx = find_header_index(header, ["market", "市场"])
+    reason_idx = find_header_index(header, ["reason", "原因"])
+    source_idx = find_header_index(header, ["source", "来源"])
+    if date_idx < 0 or trading_idx < 0:
+        return {}
+
+    records: Dict[dt.date, Dict[str, str]] = {}
+    for row in rows[1:]:
+        if not any(cell.strip() for cell in row):
+            continue
+        if date_idx >= len(row) or trading_idx >= len(row):
+            continue
+        date_raw = row[date_idx].strip()
+        trading_raw = row[trading_idx].strip()
+        if not date_raw or not trading_raw:
+            continue
+        try:
+            date_value = parse_flexible_date(date_raw)
+            is_open = _parse_yes_no_flag(trading_raw)
+        except ValueError:
+            continue
+
+        market = row[market_idx].strip() if market_idx >= 0 and market_idx < len(row) else "A_SHARE"
+        reason = row[reason_idx].strip() if reason_idx >= 0 and reason_idx < len(row) else ""
+        source = row[source_idx].strip() if source_idx >= 0 and source_idx < len(row) else ""
+        records[date_value] = {
+            "date": date_value.isoformat(),
+            "is_trading_day": "1" if is_open else "0",
+            "market": market or "A_SHARE",
+            "reason": reason,
+            "source": source,
+        }
+    return records
+
+
+def _extract_year_closed_dates_from_sse_text(text: str, target_year: int) -> Set[dt.date]:
+    year_marker = f"{target_year}年休市安排"
+    start = text.find(year_marker)
+    if start < 0:
+        return set()
+
+    tail = text[start + len(year_marker) :]
+    next_match = re.search(r"\d{4}年休市安排", tail)
+    if next_match:
+        section = text[start : start + len(year_marker) + next_match.start()]
+    else:
+        section = text[start:]
+
+    closed_dates: Set[dt.date] = set()
+
+    # Example: 1月1日（星期四）至1月3日（星期六）休市
+    range_pattern = re.compile(
+        r"(\d{1,2})月(\d{1,2})日[^。；\n]{0,40}?至(\d{1,2})月(\d{1,2})日[^。；\n]{0,30}?休市"
+    )
+    for m in range_pattern.finditer(section):
+        m1, d1, m2, d2 = map(int, m.groups())
+        start_date = dt.date(target_year, m1, d1)
+        end_date = dt.date(target_year, m2, d2)
+        if end_date < start_date:
+            continue
+        cursor = start_date
+        while cursor <= end_date:
+            closed_dates.add(cursor)
+            cursor += dt.timedelta(days=1)
+
+    # Example: 另外，1月4日（星期日）、2月14日（星期六）为周末休市
+    weekend_clause_pattern = re.compile(r"([^。；\n]{0,180}?)为周末休市")
+    for m in weekend_clause_pattern.finditer(section):
+        clause = m.group(1)
+        for mm, dd in re.findall(r"(\d{1,2})月(\d{1,2})日", clause):
+            closed_dates.add(dt.date(target_year, int(mm), int(dd)))
+
+    return closed_dates
+
+
+def fetch_official_closed_dates_from_sse(
+    target_year: int,
+    timeout: float,
+) -> Tuple[Set[dt.date], str]:
+    session = requests.Session()
+    session.headers.update(
+        {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/123.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Referer": "https://www.sse.com.cn/",
+        }
+    )
+    resp = session.get(SSE_CLOSED_ARRANGEMENT_URL, timeout=timeout)
+    resp.raise_for_status()
+    raw_html = resp.content.decode("utf-8", errors="ignore")
+    cleaned_html = re.sub(r"<script[\s\S]*?</script>", " ", raw_html, flags=re.IGNORECASE)
+    cleaned_html = re.sub(r"<style[\s\S]*?</style>", " ", cleaned_html, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", " ", cleaned_html)
+    text = html.unescape(text)
+    text = re.sub(r"\s+", " ", text)
+
+    closed_dates = _extract_year_closed_dates_from_sse_text(text, target_year)
+    if not closed_dates:
+        raise ValueError(f"SSE closed arrangement page has no parsed section for {target_year}")
+    return closed_dates, f"sse_closed_arrangement_{target_year}"
+
+
+def _official_or_weekday_calendar_row(
+    date_value: dt.date,
+    official_closed_dates: Set[dt.date] | None,
+    source_tag: str,
+) -> Dict[str, str]:
+    is_weekend = date_value.weekday() >= 5
+    is_closed_by_official = official_closed_dates is not None and date_value in official_closed_dates
+    is_trading_day = not is_weekend and not is_closed_by_official
+    if is_trading_day:
+        reason = "normal"
+    elif is_weekend:
+        reason = "weekend"
+    else:
+        reason = "holiday"
+    return {
+        "date": date_value.isoformat(),
+        "is_trading_day": "1" if is_trading_day else "0",
+        "market": "A_SHARE",
+        "reason": reason,
+        "source": source_tag,
+    }
+
+
+def append_generated_trading_calendar_year(
+    trading_calendar_csv: Path,
+    target_year: int,
+    timeout: float,
+) -> Tuple[int, int, str]:
+    existing_rows: List[List[str]] = []
+    if trading_calendar_csv.exists():
+        existing_rows, _ = read_csv_rows(trading_calendar_csv)
+    records = _normalize_existing_trading_calendar_rows(existing_rows)
+
+    official_closed_dates: Set[dt.date] | None = None
+    source_tag = f"auto_rollover_weekday_rule_{target_year}"
+    source_mode = "weekday_fallback"
+    try:
+        official_closed_dates, official_source = fetch_official_closed_dates_from_sse(target_year, timeout)
+        source_tag = official_source
+        source_mode = "official_sse"
+    except Exception:
+        official_closed_dates = None
+
+    # full-year date range
+    start_date = dt.date(target_year, 1, 1)
+    end_date = dt.date(target_year + 1, 1, 1)
+    created_count = 0
+    preserved_count = 0
+    cursor = start_date
+    while cursor < end_date:
+        if cursor in records:
+            preserved_count += 1
+        else:
+            records[cursor] = _official_or_weekday_calendar_row(
+                date_value=cursor,
+                official_closed_dates=official_closed_dates,
+                source_tag=source_tag,
+            )
+            created_count += 1
+        cursor += dt.timedelta(days=1)
+
+    output_rows: List[List[object]] = [["date", "is_trading_day", "market", "reason", "source"]]
+    for date_value in sorted(records.keys()):
+        row = records[date_value]
+        output_rows.append(
+            [
+                row.get("date", date_value.isoformat()),
+                row.get("is_trading_day", ""),
+                row.get("market", "A_SHARE"),
+                row.get("reason", ""),
+                row.get("source", ""),
+            ]
+        )
+    write_csv_rows(trading_calendar_csv, output_rows)
+    return created_count, preserved_count, source_mode
+
+
+def maybe_auto_rollover_trading_calendar(
+    trading_calendar_csv: Path,
+    trading_calendar: Dict[dt.date, bool],
+    today_date: dt.date,
+    timeout: float,
+) -> Tuple[bool, str]:
+    if today_date not in trading_calendar or not trading_calendar[today_date]:
+        return False, ""
+
+    this_year_trading_days = [d for d, is_open in trading_calendar.items() if is_open and d.year == today_date.year]
+    if not this_year_trading_days:
+        return False, ""
+    last_trading_day = max(this_year_trading_days)
+    if today_date != last_trading_day:
+        return False, ""
+
+    next_year = today_date.year + 1
+    next_year_days = [d for d in trading_calendar.keys() if d.year == next_year]
+    expected_days = (dt.date(next_year + 1, 1, 1) - dt.date(next_year, 1, 1)).days
+    if len(next_year_days) >= expected_days:
+        return False, ""
+
+    created_count, _, source_mode = append_generated_trading_calendar_year(
+        trading_calendar_csv=trading_calendar_csv,
+        target_year=next_year,
+        timeout=timeout,
+    )
+    if source_mode == "official_sse":
+        message = (
+            f"交易日历已自动追加 {next_year} 年数据，共 {created_count} 天。"
+            "来源：上交所官方休市安排公告页。"
+        )
+    else:
+        message = (
+            f"交易日历已自动追加 {next_year} 年数据，共 {created_count} 天。"
+            "来源为工作日规则，法定节假日请后续人工核对。"
+        )
+    return True, message
+
+
+def parse_cos_endpoint(cos_endpoint: str) -> Tuple[str, str, str]:
+    endpoint = cos_endpoint.strip()
+    if not endpoint:
+        raise ValueError("COS endpoint is empty")
+
+    normalized = endpoint if "://" in endpoint else f"https://{endpoint}"
+    parsed = urlparse(normalized)
+    host = parsed.netloc.strip().lower()
+    scheme = parsed.scheme.strip().lower() or "https"
+    if not host:
+        raise ValueError(f"invalid COS endpoint: {cos_endpoint}")
+
+    match = re.fullmatch(r"([a-z0-9-]+)\.cos\.([a-z0-9-]+)\.myqcloud\.com", host)
+    if not match:
+        raise ValueError(f"invalid COS endpoint host: {host}")
+    bucket = match.group(1)
+    region = match.group(2)
+    return bucket, region, scheme
+
+
+def publish_csv_files_to_cos(
+    output_dir: Path,
+    cos_endpoint: str,
+    cos_prefix: str,
+    timeout: float,
+) -> Tuple[int, int]:
+    try:
+        from qcloud_cos import CosConfig, CosS3Client
+    except Exception as exc:
+        raise RuntimeError(
+            "Missing dependency 'cos-python-sdk-v5'. Install with: "
+            "pip install cos-python-sdk-v5"
+        ) from exc
+
+    secret_id = os.getenv("COS_SECRET_ID", "").strip()
+    secret_key = os.getenv("COS_SECRET_KEY", "").strip()
+    session_token = os.getenv("COS_SESSION_TOKEN", "").strip()
+    if not secret_id or not secret_key:
+        raise RuntimeError(
+            "Missing COS credentials. Please set env vars COS_SECRET_ID and COS_SECRET_KEY."
+        )
+
+    bucket, region, scheme = parse_cos_endpoint(cos_endpoint)
+    config = CosConfig(
+        Region=region,
+        SecretId=secret_id,
+        SecretKey=secret_key,
+        Token=session_token or None,
+        Scheme=scheme,
+    )
+    client = CosS3Client(config)
+
+    prefix = cos_prefix.strip().strip("/")
+    csv_files = sorted(output_dir.glob("*.csv"))
+    if not csv_files:
+        print(f"COS publish: no CSV files found in {output_dir}")
+        return 0, 0
+
+    success_count = 0
+    error_count = 0
+    for csv_path in csv_files:
+        object_key = f"{prefix}/{csv_path.name}" if prefix else csv_path.name
+        key_with_slash = f"/{object_key}"
+        try:
+            with csv_path.open("rb") as f:
+                client.put_object(
+                    Bucket=bucket,
+                    Body=f,
+                    Key=key_with_slash,
+                    ContentType="text/csv; charset=utf-8",
+                )
+            print(f"COS uploaded: {csv_path} -> {cos_endpoint}/{object_key}")
+            success_count += 1
+        except Exception as exc:
+            print(f"COS upload failed: {csv_path} -> {object_key}; error={exc}")
+            error_count += 1
+    return success_count, error_count
+
+
+def ensure_today_covered_by_calendar(
+    trading_calendar_csv: Path,
+    trading_calendar: Dict[dt.date, bool],
+    today_date: dt.date,
+    timeout: float,
+) -> Tuple[Dict[dt.date, bool], bool, str]:
+    if today_date in trading_calendar:
+        return trading_calendar, False, ""
+    # Cross-year guard: if missing current year entirely, auto-generate to avoid runtime interruption.
+    created_count, _, source_mode = append_generated_trading_calendar_year(
+        trading_calendar_csv=trading_calendar_csv,
+        target_year=today_date.year,
+        timeout=timeout,
+    )
+    refreshed = load_trading_calendar(trading_calendar_csv)
+    return refreshed, created_count > 0, source_mode
 
 
 def find_header_index(header: List[str], aliases: List[str]) -> int:
@@ -1393,6 +1818,7 @@ def generate_daily_data(
     holdings_csv: Path,
     current_cash_csv: Path,
     cashflows_csv: Path,
+    trading_calendar_csv: Path,
     return_history_csv: Path,
     xirr_history_csv: Path,
     nav_history_csv: Path,
@@ -1403,7 +1829,62 @@ def generate_daily_data(
     output_csv: Path,
     archive_dir: Path | None,
     timeout: float,
+    notify_on_warning: bool,
+    auto_rollover_calendar: bool,
+    publish_cos: bool,
+    cos_endpoint: str,
+    cos_prefix: str,
+    cos_fail_on_error: bool,
 ) -> int:
+    today_date = dt.date.today()
+    today = today_date.isoformat()
+    trading_calendar = load_trading_calendar(trading_calendar_csv)
+    trading_calendar, calendar_autofilled, calendar_autofill_source = ensure_today_covered_by_calendar(
+        trading_calendar_csv=trading_calendar_csv,
+        trading_calendar=trading_calendar,
+        today_date=today_date,
+        timeout=timeout,
+    )
+    if calendar_autofilled:
+        if calendar_autofill_source == "official_sse":
+            warn = (
+                f"提醒：trading_calendar.csv 缺少 {today_date.year} 年数据，"
+                "已通过上交所官方休市安排公告页自动补齐。"
+            )
+        else:
+            warn = (
+                f"提醒：trading_calendar.csv 缺少 {today_date.year} 年数据，已按工作日规则自动补齐。"
+                "法定节假日请人工核对。"
+            )
+        print(warn)
+        if notify_on_warning:
+            notify_success_popup("PersonalFund 数据提醒", warn)
+    if today_date not in trading_calendar:
+        raise ValueError(f"trading calendar missing date {today}: {trading_calendar_csv}")
+    if not trading_calendar[today_date]:
+        print(f"Skip: {today} is not an A-share trading day.")
+        return 0
+
+    previous_trading_day = find_previous_trading_day(today_date, trading_calendar)
+    if previous_trading_day is not None:
+        history_paths = {
+            "return_history": return_history_csv,
+            "xirr_history": xirr_history_csv,
+            "nav_history": nav_history_csv,
+            "configuration_ratio": configuration_ratio_csv,
+        }
+        missing_previous_day_rows = find_missing_previous_day_records(previous_trading_day, history_paths)
+        if missing_previous_day_rows:
+            previous_text = previous_trading_day.isoformat()
+            warning_lines = "\n".join(missing_previous_day_rows)
+            warning_message = (
+                f"提醒：检测到上一个交易日({previous_text})在历史输出文件中存在缺失记录。\n"
+                f"{warning_lines}"
+            )
+            print(warning_message)
+            if notify_on_warning:
+                notify_success_popup("PersonalFund 数据提醒", warning_message)
+
     holdings, holdings_encoding = load_holdings(holdings_csv)
     cash_rows, cash_total, cash_encoding = load_cash_positions(current_cash_csv)
     cashflow_entries, cashflows_encoding = load_cashflow_entries(cashflows_csv)
@@ -1416,8 +1897,6 @@ def generate_daily_data(
     assets_value_sums: Dict[str, float] = {code: 0.0 for code in asset_codes}
 
     fetcher = PriceFetcher(timeout=timeout)
-    today_date = dt.date.today()
-    today = today_date.isoformat()
 
     header = [
         "日期",
@@ -1612,6 +2091,36 @@ def generate_daily_data(
         shutil.copyfile(output_csv, archive_path)
         print(f"Archived to: {archive_path}")
 
+    if auto_rollover_calendar:
+        rolled, rollover_message = maybe_auto_rollover_trading_calendar(
+            trading_calendar_csv=trading_calendar_csv,
+            trading_calendar=trading_calendar,
+            today_date=today_date,
+            timeout=timeout,
+        )
+        if rolled:
+            print(rollover_message)
+            if notify_on_warning:
+                notify_success_popup("PersonalFund 数据提醒", rollover_message)
+
+    cos_error_count = 0
+    if publish_cos:
+        output_dir = output_csv.parent
+        try:
+            cos_success_count, cos_error_count = publish_csv_files_to_cos(
+                output_dir=output_dir,
+                cos_endpoint=cos_endpoint,
+                cos_prefix=cos_prefix,
+                timeout=timeout,
+            )
+        except Exception as exc:
+            print(f"COS publish failed before upload loop: {exc}")
+            cos_success_count = 0
+            cos_error_count = 1
+        print(f"COS publish summary: success={cos_success_count}, error={cos_error_count}")
+        if cos_error_count > 0 and cos_fail_on_error:
+            return 3
+
     print(f"Wrote: {output_csv}")
     print(f"Success: {success_count}, Error: {error_count}")
     return 0 if error_count == 0 else 2
@@ -1638,6 +2147,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("data/input/cashflows.csv"),
         help="Path to cashflows.csv",
+    )
+    parser.add_argument(
+        "--trading-calendar",
+        type=Path,
+        default=Path("data/reference/trading_calendar.csv"),
+        help="Path to trading_calendar.csv",
     )
     parser.add_argument(
         "--return-history",
@@ -1728,6 +2243,43 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help="Show system popup when script exits successfully (default: true).",
     )
+    parser.add_argument(
+        "--notify-on-warning",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Show reminder popup when previous trading-day records are missing (default: true).",
+    )
+    parser.add_argument(
+        "--auto-rollover-calendar",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "On the last trading day of current year, auto-append next-year trading calendar "
+            "using weekday rule (default: true)."
+        ),
+    )
+    parser.add_argument(
+        "--publish-cos",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Publish all CSV files under output directory to COS after local generation (default: true).",
+    )
+    parser.add_argument(
+        "--cos-endpoint",
+        default=DEFAULT_COS_ENDPOINT,
+        help="COS endpoint host, e.g. bucket-appid.cos.ap-guangzhou.myqcloud.com",
+    )
+    parser.add_argument(
+        "--cos-prefix",
+        default="data/output",
+        help="Remote object key prefix for uploaded CSV files (default: data/output).",
+    )
+    parser.add_argument(
+        "--cos-fail-on-error",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Return non-zero when COS publish fails (default: true).",
+    )
     return parser
 
 
@@ -1751,6 +2303,7 @@ def run_python_engine(args: argparse.Namespace, archive_dir: Path | None) -> int
         holdings_csv=args.holdings,
         current_cash_csv=args.current_cash,
         cashflows_csv=args.cashflows,
+        trading_calendar_csv=args.trading_calendar,
         return_history_csv=args.return_history,
         xirr_history_csv=args.xirr_history,
         nav_history_csv=args.nav_history,
@@ -1761,6 +2314,12 @@ def run_python_engine(args: argparse.Namespace, archive_dir: Path | None) -> int
         output_csv=args.output,
         archive_dir=archive_dir,
         timeout=args.timeout,
+        notify_on_warning=args.notify_on_warning,
+        auto_rollover_calendar=args.auto_rollover_calendar,
+        publish_cos=args.publish_cos,
+        cos_endpoint=args.cos_endpoint,
+        cos_prefix=args.cos_prefix,
+        cos_fail_on_error=args.cos_fail_on_error,
     )
 
 

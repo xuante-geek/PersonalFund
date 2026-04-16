@@ -3,3 +3,4 @@
 .pytest_cache/
 .venv/
 node_modules/
+data/logs/
