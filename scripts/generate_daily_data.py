@@ -588,12 +588,44 @@ def parse_cos_endpoint(cos_endpoint: str) -> Tuple[str, str, str]:
     return bucket, region, scheme
 
 
+def load_env_file(dotenv_path: Path, override: bool = False) -> None:
+    if not dotenv_path.exists():
+        return
+    try:
+        content = dotenv_path.read_text(encoding="utf-8")
+    except Exception:
+        return
+
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].strip()
+        if "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            continue
+        if value and len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+
+        if override or key not in os.environ:
+            os.environ[key] = value
+
+
 def publish_csv_files_to_cos(
     output_dir: Path,
     cos_endpoint: str,
     cos_prefix: str,
     timeout: float,
 ) -> Tuple[int, int]:
+    project_root = Path(__file__).resolve().parents[1]
+    load_env_file(project_root / ".env", override=False)
+
     try:
         from qcloud_cos import CosConfig, CosS3Client
     except Exception as exc:
@@ -751,7 +783,7 @@ def benchmark_display_name(key: str) -> str:
 
 
 def benchmark_normalized_col(key: str) -> str:
-    return f"{benchmark_display_name(key)}除首"
+    return benchmark_display_name(key)
 
 
 def benchmark_close_col(key: str) -> str:
@@ -766,6 +798,10 @@ def benchmark_legacy_normalized_col(key: str) -> str:
     return f"{key}_normalized"
 
 
+def benchmark_legacy_chinese_normalized_col(key: str) -> str:
+    return f"{benchmark_display_name(key)}除首"
+
+
 def build_benchmark_column_alias_map() -> Dict[str, str]:
     mapping: Dict[str, str] = {}
     for cfg in BENCHMARK_INDEXES:
@@ -776,6 +812,7 @@ def build_benchmark_column_alias_map() -> Dict[str, str]:
         mapping[new_norm] = new_norm
         mapping[benchmark_legacy_close_col(key)] = new_close
         mapping[benchmark_legacy_normalized_col(key)] = new_norm
+        mapping[benchmark_legacy_chinese_normalized_col(key)] = new_norm
     return mapping
 
 
