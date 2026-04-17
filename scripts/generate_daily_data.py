@@ -29,11 +29,12 @@ XIRR_MAX = 1.0
 COL_DATE = "日期"
 COL_ASSETS_TOTAL = "总市值"
 COL_COST_TOTAL = "总成本"
+COL_TOTAL_PROFIT = "总收益"
 COL_RETURN = "收益率"
 COL_XIRR = "XIRR"
 COL_FUND_SHARE = "基金份额"
 COL_FUND_NAV = "基金净值"
-RETURN_HISTORY_HEADER = [COL_DATE, COL_ASSETS_TOTAL, COL_COST_TOTAL, COL_RETURN]
+RETURN_HISTORY_HEADER = [COL_DATE, COL_ASSETS_TOTAL, COL_COST_TOTAL, COL_TOTAL_PROFIT, COL_RETURN]
 XIRR_HISTORY_HEADER = [COL_DATE, COL_ASSETS_TOTAL, COL_XIRR]
 NAV_BASE_HEADER = [COL_DATE, COL_ASSETS_TOTAL, COL_COST_TOTAL, COL_FUND_SHARE, COL_FUND_NAV]
 BENCHMARK_BASE_DATE = dt.date(2026, 4, 13)
@@ -1193,6 +1194,7 @@ def _normalize_existing_return_history_rows(rows: List[List[str]]) -> Dict[str, 
     date_idx = find_header_index(header, [COL_DATE, "date"])
     assets_idx = find_header_index(header, [COL_ASSETS_TOTAL, "assets_total"])
     cost_idx = find_header_index(header, [COL_COST_TOTAL, "cost_total"])
+    profit_idx = find_header_index(header, [COL_TOTAL_PROFIT, "total_profit", "profit"])
     if date_idx < 0 or assets_idx < 0 or cost_idx < 0:
         return {}
 
@@ -1206,15 +1208,20 @@ def _normalize_existing_return_history_rows(rows: List[List[str]]) -> Dict[str, 
 
         assets_value = ""
         cost_value = ""
+        profit_value = ""
         return_value: float | str = ""
         if assets_idx < len(row) and row[assets_idx].strip():
             assets_value = round1(parse_number(row[assets_idx]))
         if cost_idx < len(row) and row[cost_idx].strip():
             cost_value = round1(parse_number(row[cost_idx]))
+        if profit_idx >= 0 and profit_idx < len(row) and row[profit_idx].strip():
+            profit_value = round1(parse_number(row[profit_idx]))
+        if profit_value == "" and assets_value != "" and cost_value != "":
+            profit_value = round1(float(assets_value) - float(cost_value))
         if assets_value != "" and cost_value != "" and float(cost_value) > 0:
             return_value = round_rate(float(assets_value) / float(cost_value) - 1.0)
 
-        records[date_text] = [date_text, assets_value, cost_value, return_value]
+        records[date_text] = [date_text, assets_value, cost_value, profit_value, return_value]
 
     return records
 
@@ -1233,11 +1240,13 @@ def upsert_return_history(
     return_history: float | str = ""
     if cost_total > 0:
         return_history = round_rate(assets_total / cost_total - 1.0)
+    total_profit = round1(assets_total - cost_total)
 
     records[date_text] = [
         date_text,
         round1(assets_total),
         round1(cost_total),
+        total_profit,
         return_history,
     ]
 
