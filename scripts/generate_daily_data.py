@@ -1095,11 +1095,16 @@ def load_cashflow_entries(csv_path: Path) -> Tuple[List[CashflowEntry], str]:
 
 
 def compute_cost_total(cashflow_entries: List[CashflowEntry]) -> float:
-    cost_total = 0.0
-    for entry in cashflow_entries:
-        if entry.amount < 0:
-            cost_total += -entry.amount
-    return round6(cost_total)
+    # amount: inflow<0, outflow>0
+    # cost_total uses net invested capital: -(sum(amount))
+    # inflow increases cost_total, outflow decreases cost_total.
+    return round6(-sum(entry.amount for entry in cashflow_entries))
+
+
+def compute_daily_net_flow(cashflow_entries: List[CashflowEntry], target_date: dt.date) -> float:
+    # flow_t sign convention for share adjustment:
+    # inflow -> positive, outflow -> negative
+    return round6(-sum(entry.amount for entry in cashflow_entries if entry.date_value == target_date))
 
 
 def _xnpv(rate: float, cashflows: List[Tuple[dt.date, float]]) -> float:
@@ -1501,6 +1506,7 @@ def upsert_nav_history(
     date_text: str,
     assets_total: float,
     cost_total: float,
+    daily_net_flow: float,
     benchmark_points: Dict[str, float],
 ) -> None:
     records: Dict[str, Dict[str, object]] = {}
@@ -1518,9 +1524,6 @@ def upsert_nav_history(
             fund_share = round4(assets_total)
         fund_nav = 1.0
     else:
-        prev_cost_total = (
-            float(previous_record[COL_COST_TOTAL]) if previous_record.get(COL_COST_TOTAL, "") != "" else 0.0
-        )
         prev_fund_share = (
             float(previous_record[COL_FUND_SHARE]) if previous_record.get(COL_FUND_SHARE, "") != "" else 0.0
         )
@@ -1528,13 +1531,12 @@ def upsert_nav_history(
         if prev_fund_share <= 0 or prev_fund_nav <= 0:
             raise ValueError("Invalid previous nav_history row: fund_share/fund_nav must be positive")
 
-        cost_change = cost_total - prev_cost_total
-        if abs(cost_change) < 1e-9:
+        # Share change is based on today's external net flow (inflow positive, outflow negative),
+        # priced at previous trading day's NAV.
+        if abs(daily_net_flow) < 1e-9:
             fund_share = prev_fund_share
-        elif cost_change > 0:
-            fund_share = prev_fund_share + (cost_change / prev_fund_nav)
         else:
-            fund_share = prev_fund_share - ((-cost_change) / prev_fund_nav)
+            fund_share = prev_fund_share + (daily_net_flow / prev_fund_nav)
 
         if fund_share <= 0:
             raise ValueError("Computed fund_share <= 0, check cashflows/cost_total history consistency")
@@ -1881,6 +1883,7 @@ def generate_daily_data(
     cos_endpoint: str,
     cos_prefix: str,
     cos_fail_on_error: bool,
+    non_trading_debug_no_write: bool,
 ) -> int:
     today_date = dt.date.today()
     today = today_date.isoformat()
@@ -1907,9 +1910,13 @@ def generate_daily_data(
             notify_success_popup("PersonalFund 数据提醒", warn)
     if today_date not in trading_calendar:
         raise ValueError(f"trading calendar missing date {today}: {trading_calendar_csv}")
-    if not trading_calendar[today_date]:
+    is_trading_day = bool(trading_calendar[today_date])
+    if not is_trading_day and not non_trading_debug_no_write:
         print(f"Skip: {today} is not an A-share trading day.")
         return 0
+    debug_no_write_mode = (not is_trading_day and non_trading_debug_no_write)
+    if debug_no_write_mode:
+        print(f"Debug mode: {today} is non-trading day, run calculations without persisting CSV/history.")
 
     previous_trading_day = find_previous_trading_day(today_date, trading_calendar)
     if previous_trading_day is not None:
@@ -1935,6 +1942,7 @@ def generate_daily_data(
     cash_rows, cash_total, cash_encoding = load_cash_positions(current_cash_csv)
     cashflow_entries, cashflows_encoding = load_cashflow_entries(cashflows_csv)
     cost_total = compute_cost_total(cashflow_entries)
+    daily_net_flow = compute_daily_net_flow(cashflow_entries, today_date)
     cashflow_count = len(cashflow_entries)
     product_map = load_variable_mapping(product_ref_csv)
     assets_map = load_variable_mapping(assets_ref_csv)
@@ -2092,82 +2100,86 @@ def generate_daily_data(
             (
                 f"holdings_encoding={holdings_encoding}; cash_encoding={cash_encoding}; "
                 f"cashflows_encoding={cashflows_encoding}; cash_total={cash_total}; "
-                f"cost_total={cost_total}; cashflow_count={cashflow_count}; "
+                f"cost_total={cost_total}; daily_net_flow={daily_net_flow}; cashflow_count={cashflow_count}; "
                 f"success={success_count}; error={error_count}"
             ),
         ]
     )
 
-    write_csv_rows(output_csv, output_rows)
-    if has_total_data:
-        assets_total_rounded = round6(total_value)
-        benchmark_points = fetch_benchmark_index_points(timeout=timeout)
-        upsert_return_history(
-            return_history_csv=return_history_csv,
-            date_text=today,
-            assets_total=assets_total_rounded,
-            cost_total=round6(cost_total),
-        )
-        xirr_value = compute_xirr(cashflow_entries, today_date, assets_total_rounded)
-        upsert_xirr_history(
-            xirr_history_csv=xirr_history_csv,
-            date_text=today,
-            assets_total=assets_total_rounded,
-            xirr_value=xirr_value,
-        )
-        upsert_nav_history(
-            nav_history_csv=nav_history_csv,
-            date_text=today,
-            assets_total=assets_total_rounded,
-            cost_total=round6(cost_total),
-            benchmark_points=benchmark_points,
-        )
-        upsert_configuration_ratio_history(
-            configuration_ratio_csv=configuration_ratio_csv,
-            date_text=today,
-            assets_total=assets_total_rounded,
-            assets_value_sums=assets_value_sums,
-            asset_codes=asset_codes,
-            assets_map=assets_map,
-        )
+    if debug_no_write_mode:
+        print("Debug mode: skip writing output/history/archive and skip COS publish.")
+    else:
+        write_csv_rows(output_csv, output_rows)
+        if has_total_data:
+            assets_total_rounded = round6(total_value)
+            benchmark_points = fetch_benchmark_index_points(timeout=timeout)
+            upsert_return_history(
+                return_history_csv=return_history_csv,
+                date_text=today,
+                assets_total=assets_total_rounded,
+                cost_total=round6(cost_total),
+            )
+            xirr_value = compute_xirr(cashflow_entries, today_date, assets_total_rounded)
+            upsert_xirr_history(
+                xirr_history_csv=xirr_history_csv,
+                date_text=today,
+                assets_total=assets_total_rounded,
+                xirr_value=xirr_value,
+            )
+            upsert_nav_history(
+                nav_history_csv=nav_history_csv,
+                date_text=today,
+                assets_total=assets_total_rounded,
+                cost_total=round6(cost_total),
+                daily_net_flow=round6(daily_net_flow),
+                benchmark_points=benchmark_points,
+            )
+            upsert_configuration_ratio_history(
+                configuration_ratio_csv=configuration_ratio_csv,
+                date_text=today,
+                assets_total=assets_total_rounded,
+                assets_value_sums=assets_value_sums,
+                asset_codes=asset_codes,
+                assets_map=assets_map,
+            )
 
-    if archive_dir is not None:
-        archive_dir.mkdir(parents=True, exist_ok=True)
-        archive_path = archive_dir / f"daily_data_{today}.csv"
-        shutil.copyfile(output_csv, archive_path)
-        print(f"Archived to: {archive_path}")
+        if archive_dir is not None:
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            archive_path = archive_dir / f"daily_data_{today}.csv"
+            shutil.copyfile(output_csv, archive_path)
+            print(f"Archived to: {archive_path}")
 
-    if auto_rollover_calendar:
-        rolled, rollover_message = maybe_auto_rollover_trading_calendar(
-            trading_calendar_csv=trading_calendar_csv,
-            trading_calendar=trading_calendar,
-            today_date=today_date,
-            timeout=timeout,
-        )
-        if rolled:
-            print(rollover_message)
-            if notify_on_warning:
-                notify_success_popup("PersonalFund 数据提醒", rollover_message)
-
-    cos_error_count = 0
-    if publish_cos:
-        output_dir = output_csv.parent
-        try:
-            cos_success_count, cos_error_count = publish_csv_files_to_cos(
-                output_dir=output_dir,
-                cos_endpoint=cos_endpoint,
-                cos_prefix=cos_prefix,
+        if auto_rollover_calendar:
+            rolled, rollover_message = maybe_auto_rollover_trading_calendar(
+                trading_calendar_csv=trading_calendar_csv,
+                trading_calendar=trading_calendar,
+                today_date=today_date,
                 timeout=timeout,
             )
-        except Exception as exc:
-            print(f"COS publish failed before upload loop: {exc}")
-            cos_success_count = 0
-            cos_error_count = 1
-        print(f"COS publish summary: success={cos_success_count}, error={cos_error_count}")
-        if cos_error_count > 0 and cos_fail_on_error:
-            return 3
+            if rolled:
+                print(rollover_message)
+                if notify_on_warning:
+                    notify_success_popup("PersonalFund 数据提醒", rollover_message)
 
-    print(f"Wrote: {output_csv}")
+        cos_error_count = 0
+        if publish_cos:
+            output_dir = output_csv.parent
+            try:
+                cos_success_count, cos_error_count = publish_csv_files_to_cos(
+                    output_dir=output_dir,
+                    cos_endpoint=cos_endpoint,
+                    cos_prefix=cos_prefix,
+                    timeout=timeout,
+                )
+            except Exception as exc:
+                print(f"COS publish failed before upload loop: {exc}")
+                cos_success_count = 0
+                cos_error_count = 1
+            print(f"COS publish summary: success={cos_success_count}, error={cos_error_count}")
+            if cos_error_count > 0 and cos_fail_on_error:
+                return 3
+
+        print(f"Wrote: {output_csv}")
     print(f"Success: {success_count}, Error: {error_count}")
     return 0 if error_count == 0 else 2
 
@@ -2326,6 +2338,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help="Return non-zero when COS publish fails (default: true).",
     )
+    parser.add_argument(
+        "--non-trading-debug-no-write",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Allow running on non-trading day for debugging, but do not persist any output/history/archive "
+            "or COS publish (default: false)."
+        ),
+    )
     return parser
 
 
@@ -2366,6 +2387,7 @@ def run_python_engine(args: argparse.Namespace, archive_dir: Path | None) -> int
         cos_endpoint=args.cos_endpoint,
         cos_prefix=args.cos_prefix,
         cos_fail_on_error=args.cos_fail_on_error,
+        non_trading_debug_no_write=args.non_trading_debug_no_write,
     )
 
 

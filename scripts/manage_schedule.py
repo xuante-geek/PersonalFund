@@ -176,12 +176,27 @@ def status_schedule(args: argparse.Namespace) -> int:
 def run_now(args: argparse.Namespace) -> int:
     ensure_macos()
     label = args.label
-    result = run_cmd(["launchctl", "kickstart", "-k", service_name(label)])
-    if result.returncode != 0:
-        msg = (result.stderr or result.stdout).strip() or "launchctl kickstart failed"
-        raise RuntimeError(msg)
-    print(f"Triggered: {service_name(label)}")
-    return 0
+    if args.via_launchd:
+        result = run_cmd(["launchctl", "kickstart", "-k", service_name(label)])
+        if result.returncode != 0:
+            msg = (result.stderr or result.stdout).strip() or "launchctl kickstart failed"
+            raise RuntimeError(msg)
+        print(f"Triggered via launchd: {service_name(label)}")
+        return 0
+
+    root = project_root()
+    python_bin = default_python_bin(root)
+    job_script = default_job_script(root)
+    command = [
+        str(python_bin),
+        str(job_script),
+        "--engine",
+        "python",
+        "--non-trading-debug-no-write",
+    ]
+    print(f"Running debug-safe now: {' '.join(command)}")
+    result = subprocess.run(command, cwd=str(root))
+    return result.returncode
 
 
 def print_example(args: argparse.Namespace) -> int:
@@ -230,8 +245,13 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--label", default=DEFAULT_LABEL, help="launchd label")
     status.set_defaults(func=status_schedule)
 
-    run = sub.add_parser("run-now", help="Trigger scheduled job immediately")
+    run = sub.add_parser("run-now", help="Run job now (safe debug mode by default)")
     run.add_argument("--label", default=DEFAULT_LABEL, help="launchd label")
+    run.add_argument(
+        "--via-launchd",
+        action="store_true",
+        help="Use launchctl kickstart instead of direct debug-safe run.",
+    )
     run.set_defaults(func=run_now)
 
     example = sub.add_parser("print-plist", help="Print example plist XML")
