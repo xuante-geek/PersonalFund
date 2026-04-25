@@ -192,9 +192,13 @@ def run_now(args: argparse.Namespace) -> int:
         str(job_script),
         "--engine",
         "python",
-        "--non-trading-debug-no-write",
     ]
-    print(f"Running debug-safe now: {' '.join(command)}")
+    if args.allow_non_trading_write:
+        command.append("--non-trading-force-write")
+        print(f"Running debug force-write now: {' '.join(command)}")
+    else:
+        command.append("--non-trading-debug-no-write")
+        print(f"Running debug-safe now: {' '.join(command)}")
     result = subprocess.run(command, cwd=str(root))
     return result.returncode
 
@@ -251,6 +255,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--via-launchd",
         action="store_true",
         help="Use launchctl kickstart instead of direct debug-safe run.",
+    )
+    run.add_argument(
+        "--allow-non-trading-write",
+        action="store_true",
+        help="Temporarily allow non-trading-day run to write output/history/archive (debug only).",
     )
     run.set_defaults(func=run_now)
 

@@ -24,6 +24,7 @@ DECIMAL_PLACES = 6
 RATE_DECIMAL_PLACES = 4
 RETURN_HISTORY_VALUE_DECIMAL_PLACES = 1
 NAV_DECIMAL_PLACES = 4
+ASSET_RATIO_DECIMAL_PLACES = 4
 XIRR_MIN = -1.0
 XIRR_MAX = 1.0
 COL_DATE = "日期"
@@ -34,9 +35,18 @@ COL_RETURN = "收益率"
 COL_XIRR = "XIRR"
 COL_FUND_SHARE = "基金份额"
 COL_FUND_NAV = "基金净值"
+COL_STOCK_COMPONENT_TOTAL = "股票成分总市值"
 RETURN_HISTORY_HEADER = [COL_DATE, COL_ASSETS_TOTAL, COL_COST_TOTAL, COL_TOTAL_PROFIT, COL_RETURN]
 XIRR_HISTORY_HEADER = [COL_DATE, COL_ASSETS_TOTAL, COL_XIRR]
 NAV_BASE_HEADER = [COL_DATE, COL_ASSETS_TOTAL, COL_COST_TOTAL, COL_FUND_SHARE, COL_FUND_NAV]
+STOCK_ASSET_TYPES = {
+    "中国大盘",
+    "中国中盘",
+    "中国小盘",
+    "美股",
+    "发达市场",
+    "新兴市场",
+}
 BENCHMARK_BASE_DATE = dt.date(2026, 4, 13)
 SSE_CLOSED_ARRANGEMENT_URL = "https://www.sse.com.cn/disclosure/dealinstruc/closed/"
 DEFAULT_COS_ENDPOINT = "personalfund-data-1399092305.cos.ap-guangzhou.myqcloud.com"
@@ -129,9 +139,6 @@ class HoldingRow:
     target_amount_raw: str
     target_cost_raw: str
     quote_url: str
-    product_variable: str
-    assets_variable: str
-    industry_variable: str
 
 
 @dataclass
@@ -210,12 +217,8 @@ def extract_target_digits(value: str) -> str:
     return match.group(1)
 
 
-def normalize_quote_url(target_code: str, quote_url: str, product_variable: str) -> str:
-    product = normalize_code(product_variable)
-    if product == "3":
-        digits = extract_target_digits(target_code)
-        if digits:
-            return f"https://gu.qq.com/jj{digits}"
+def normalize_quote_url(target_code: str, quote_url: str) -> str:
+    _ = target_code
     return quote_url.strip()
 
 
@@ -759,6 +762,10 @@ def round4(value: float) -> float:
     return round(float(value), NAV_DECIMAL_PLACES)
 
 
+def round_asset_ratio(value: float) -> float:
+    return round(float(value), ASSET_RATIO_DECIMAL_PLACES)
+
+
 def round_rate(value: float) -> float:
     return round(float(value), RATE_DECIMAL_PLACES)
 
@@ -825,32 +832,6 @@ def build_nav_history_header() -> List[str]:
     return header
 
 
-def sort_asset_codes(assets_map: Dict[str, str]) -> List[str]:
-    def _key(code: str) -> Tuple[int, int | str]:
-        if re.fullmatch(r"-?\d+", code):
-            return (0, int(code))
-        return (1, code)
-
-    return sorted(assets_map.keys(), key=_key)
-
-
-def configuration_value_col(asset_name: str) -> str:
-    return f"{asset_name}市值"
-
-
-def configuration_ratio_col(asset_name: str) -> str:
-    return f"{asset_name}配置比例"
-
-
-def build_configuration_ratio_header(asset_codes: List[str], assets_map: Dict[str, str]) -> List[str]:
-    header = [COL_DATE, COL_ASSETS_TOTAL]
-    for code in asset_codes:
-        asset_name = assets_map.get(code, f"assets_{code}")
-        header.append(configuration_value_col(asset_name))
-        header.append(configuration_ratio_col(asset_name))
-    return header
-
-
 def extract_decimal_candidates(text: str, pattern: str) -> List[float]:
     candidates: List[float] = []
     for match in re.finditer(pattern, text, flags=re.IGNORECASE):
@@ -899,18 +880,17 @@ def extract_nav_4dp_near_netvalue(text: str) -> float | None:
 
 
 def choose_candidate_for_product(
-    candidates: List[float], product_variable: str
+    candidates: List[float], is_fund: bool
 ) -> float | None:
     if not candidates:
         return None
 
-    product = normalize_code(product_variable)
     filtered = [value for value in candidates if 0.0001 <= value <= 100000]
     if not filtered:
         return None
 
     # 基金净值通常在更小数值区间，优先取更“像净值”的值。
-    if product == "3":
+    if is_fund:
         nav_like = [value for value in filtered if 0.1 <= value <= 20]
         if nav_like:
             return nav_like[0]
@@ -923,10 +903,8 @@ def choose_candidate_for_product(
 def extract_price_from_html_text(
     raw_html: str,
     body_text: str,
-    product_variable: str,
+    is_fund: bool,
 ) -> float | None:
-    product = normalize_code(product_variable)
-
     # 优先使用关键词附近的价格，降低误匹配页面其它数值（如日期、涨跌幅、成交量）。
     fund_patterns = [
         r'"dwjz"\s*:\s*"(\d+\.\d{2,6})"',
@@ -950,9 +928,9 @@ def extract_price_from_html_text(
     ]
 
     text_sources = [raw_html, body_text]
-    preferred_patterns = fund_patterns if product == "3" else stock_patterns
+    preferred_patterns = fund_patterns if is_fund else stock_patterns
 
-    if product == "3":
+    if is_fund:
         # Extra fallback: pick 4-decimal price close to "净值" keywords.
         for source in (body_text, raw_html):
             value = extract_nav_4dp_near_netvalue(source)
@@ -964,7 +942,7 @@ def extract_price_from_html_text(
             continue
         for pattern in preferred_patterns:
             candidates = extract_decimal_candidates(source, pattern)
-            picked = choose_candidate_for_product(candidates, product)
+            picked = choose_candidate_for_product(candidates, is_fund)
             if picked is not None:
                 return picked
 
@@ -973,36 +951,23 @@ def extract_price_from_html_text(
             continue
         for pattern in generic_patterns:
             candidates = extract_decimal_candidates(source, pattern)
-            picked = choose_candidate_for_product(candidates, product)
+            picked = choose_candidate_for_product(candidates, is_fund)
             if picked is not None:
                 return picked
 
     return None
 
 
-def load_variable_mapping(csv_path: Path) -> Dict[str, str]:
-    rows, _ = read_csv_rows(csv_path)
-    mapping: Dict[str, str] = {}
-    for row in rows[1:]:
-        if len(row) < 2:
-            continue
-        label = row[0].strip()
-        code = normalize_code(row[1])
-        if code:
-            mapping[code] = label
-    return mapping
-
-
 def load_holdings(csv_path: Path) -> Tuple[List[HoldingRow], str]:
     rows, encoding = read_csv_rows(csv_path)
     holdings: List[HoldingRow] = []
     for index, raw_row in enumerate(rows[1:], start=2):
-        row = (raw_row + [""] * 8)[:8]
+        row = (raw_row + [""] * 5)[:5]
         row = [cell.strip() for cell in row]
         if not any(row):
             continue
         # Fixed format:
-        # A-H: name,code,amount,cost,url,product,assets,industry
+        # A-E: name,code,amount,cost,url
         raw_target_code = row[1]
         target_code = normalize_target_code(raw_target_code)
         if not looks_like_target_code(target_code):
@@ -1011,7 +976,6 @@ def load_holdings(csv_path: Path) -> Tuple[List[HoldingRow], str]:
         normalized_quote_url = normalize_quote_url(
             target_code=target_code,
             quote_url=row[4],
-            product_variable=row[5],
         )
 
         holdings.append(
@@ -1022,9 +986,6 @@ def load_holdings(csv_path: Path) -> Tuple[List[HoldingRow], str]:
                 target_amount_raw=row[2],
                 target_cost_raw=row[3],
                 quote_url=normalized_quote_url,
-                product_variable=row[5],
-                assets_variable=row[6],
-                industry_variable=row[7],
             )
         )
     return holdings, encoding
@@ -1590,7 +1551,118 @@ def upsert_nav_history(
     write_csv_rows(nav_history_csv, output_rows)
 
 
-def _normalize_existing_configuration_ratio_rows(
+def _parse_percent_cell(text: str) -> float:
+    raw = text.strip()
+    if not raw:
+        return 0.0
+    has_percent_sign = "%" in raw or "％" in raw
+    cleaned = raw.replace("%", "").replace("％", "").replace(",", "").strip()
+    value = float(cleaned)
+    if has_percent_sign or abs(value) > 1.0:
+        return value / 100.0
+    return value
+
+
+def _normalize_distribution_code(value: str) -> str:
+    raw = value.strip()
+    if not raw:
+        return ""
+    low = raw.lower()
+    if low in {"cash", "cash_total"}:
+        return "cash"
+    candidate = normalize_target_code(raw)
+    if looks_like_target_code(candidate):
+        return candidate
+    return low
+
+
+def _holding_lookup_codes(code: str) -> List[str]:
+    keys: List[str] = []
+    normalized = normalize_target_code(code)
+    if normalized:
+        keys.append(normalized)
+    digits = extract_target_digits(normalized)
+    if digits:
+        keys.append(digits)
+        keys.append(str(int(digits)))
+    return [key for key in keys if key]
+
+
+def compute_asset_distribution_values(
+    asset_distribution_csv: Path,
+    holding_values: Dict[str, float],
+    cash_total: float,
+) -> Tuple[List[str], Dict[str, float], List[str]]:
+    rows, _ = read_csv_rows(asset_distribution_csv)
+    if len(rows) < 3:
+        raise ValueError(f"asset distribution csv invalid: {asset_distribution_csv}")
+
+    name_row = rows[0]
+    code_row = rows[1] if len(rows) > 1 else []
+    max_cols = max(len(name_row), len(code_row))
+
+    code_to_value: Dict[str, float] = {}
+    for code_key, value in holding_values.items():
+        for key in _holding_lookup_codes(code_key):
+            code_to_value[key] = value
+    code_to_value["cash"] = cash_total
+
+    columns: List[Tuple[int, str, str, float]] = []
+    warnings: List[str] = []
+    for col_idx in range(1, max_cols):
+        name = name_row[col_idx].strip() if col_idx < len(name_row) else ""
+        code_raw = code_row[col_idx].strip() if col_idx < len(code_row) else ""
+        normalized_code = _normalize_distribution_code(code_raw)
+        if not name and not normalized_code:
+            continue
+        value = code_to_value.get(normalized_code, 0.0)
+        if normalized_code and normalized_code not in code_to_value:
+            warnings.append(f"asset_distribution 代码未匹配持仓市值: {code_raw} (列 {col_idx + 1})")
+        columns.append((col_idx, name, normalized_code, value))
+
+    asset_names: List[str] = []
+    asset_value_sums: Dict[str, float] = {}
+    for raw_row in rows[2:]:
+        if not raw_row:
+            continue
+        asset_name = raw_row[0].strip() if len(raw_row) > 0 else ""
+        if not asset_name:
+            continue
+        if asset_name in {"总计", "合计", "total", "TOTAL"}:
+            continue
+        total_value = 0.0
+        for col_idx, _, _, market_value in columns:
+            pct_text = raw_row[col_idx] if col_idx < len(raw_row) else ""
+            try:
+                weight = _parse_percent_cell(pct_text)
+            except ValueError:
+                raise ValueError(
+                    f"asset_distribution 无法解析百分比: 资产类型={asset_name}, 列={col_idx + 1}, 值='{pct_text}'"
+                )
+            total_value += market_value * weight
+        asset_names.append(asset_name)
+        asset_value_sums[asset_name] = round6(total_value)
+
+    return asset_names, asset_value_sums, warnings
+
+
+def _asset_distribution_value_col(asset_name: str) -> str:
+    return f"{asset_name}市值"
+
+
+def _asset_distribution_ratio_col(asset_name: str) -> str:
+    return f"{asset_name}仓位"
+
+
+def build_asset_distribution_ratio_header(asset_names: List[str]) -> List[str]:
+    header = [COL_DATE, COL_ASSETS_TOTAL]
+    for name in asset_names:
+        header.append(_asset_distribution_value_col(name))
+        header.append(_asset_distribution_ratio_col(name))
+    return header
+
+
+def _normalize_existing_asset_distribution_ratio_rows(
     rows: List[List[str]],
     header: List[str],
 ) -> Dict[str, Dict[str, object]]:
@@ -1606,7 +1678,7 @@ def _normalize_existing_configuration_ratio_rows(
     records: Dict[str, Dict[str, object]] = {}
     header_set = set(header)
     value_cols = {col for col in header if col.endswith("市值")} | {COL_ASSETS_TOTAL}
-    ratio_cols = {col for col in header if col.endswith("配置比例")}
+    ratio_cols = {col for col in header if col.endswith("仓位")}
 
     for row in rows[1:]:
         if not any(cell.strip() for cell in row):
@@ -1633,37 +1705,38 @@ def _normalize_existing_configuration_ratio_rows(
             if col_name in value_cols:
                 record[col_name] = round1(parse_number(cell))
             elif col_name in ratio_cols:
-                record[col_name] = round4(parse_number(cell))
+                record[col_name] = round_asset_ratio(parse_number(cell))
 
         records[date_text] = record
 
     return records
 
 
-def upsert_configuration_ratio_history(
-    configuration_ratio_csv: Path,
+def upsert_asset_distribution_ratio_history(
+    asset_distribution_ratio_csv: Path,
     date_text: str,
     assets_total: float,
-    assets_value_sums: Dict[str, float],
-    asset_codes: List[str],
-    assets_map: Dict[str, str],
+    asset_names: List[str],
+    asset_value_sums: Dict[str, float],
 ) -> None:
-    header = build_configuration_ratio_header(asset_codes, assets_map)
+    header = build_asset_distribution_ratio_header(asset_names)
     records: Dict[str, Dict[str, object]] = {}
-    if configuration_ratio_csv.exists():
-        rows, _ = read_csv_rows(configuration_ratio_csv)
-        records = _normalize_existing_configuration_ratio_rows(rows, header)
+    if asset_distribution_ratio_csv.exists():
+        rows, _ = read_csv_rows(asset_distribution_ratio_csv)
+        records = _normalize_existing_asset_distribution_ratio_rows(rows, header)
 
     record: Dict[str, object] = records.get(date_text, {col: "" for col in header})
     record[COL_DATE] = date_text
     record[COL_ASSETS_TOTAL] = round1(assets_total)
 
-    for code in asset_codes:
-        asset_name = assets_map.get(code, f"assets_{code}")
-        value_col = configuration_value_col(asset_name)
-        ratio_col = configuration_ratio_col(asset_name)
-        value = round1(assets_value_sums.get(code, 0.0))
-        ratio = round4(value / assets_total) if assets_total > 0 else 0.0
+    for name in asset_names:
+        value_col = _asset_distribution_value_col(name)
+        ratio_col = _asset_distribution_ratio_col(name)
+        raw_value = float(asset_value_sums.get(name, 0.0))
+        value = round1(raw_value)
+        ratio = round_asset_ratio(raw_value / assets_total) if assets_total > 0 else 0.0
+        if ratio == -0.0:
+            ratio = 0.0
         record[value_col] = value
         record[ratio_col] = ratio
 
@@ -1675,7 +1748,225 @@ def upsert_configuration_ratio_history(
         row_record = records[date_key]
         output_rows.append([row_record.get(col, "") for col in header])
 
-    write_csv_rows(configuration_ratio_csv, output_rows)
+    write_csv_rows(asset_distribution_ratio_csv, output_rows)
+
+
+def compute_stock_component_values(
+    asset_distribution_csv: Path,
+    holding_values: Dict[str, float],
+    cash_total: float,
+) -> Tuple[Dict[str, float], float, List[str]]:
+    rows, _ = read_csv_rows(asset_distribution_csv)
+    if len(rows) < 3:
+        raise ValueError(f"asset distribution csv invalid: {asset_distribution_csv}")
+
+    name_row = rows[0]
+    code_row = rows[1] if len(rows) > 1 else []
+    max_cols = max(len(name_row), len(code_row))
+
+    code_to_value: Dict[str, float] = {}
+    for code_key, value in holding_values.items():
+        for key in _holding_lookup_codes(code_key):
+            code_to_value[key] = value
+    code_to_value["cash"] = cash_total
+
+    columns: List[Tuple[int, str, str, float]] = []
+    warnings: List[str] = []
+    for col_idx in range(1, max_cols):
+        name = name_row[col_idx].strip() if col_idx < len(name_row) else ""
+        code_raw = code_row[col_idx].strip() if col_idx < len(code_row) else ""
+        normalized_code = _normalize_distribution_code(code_raw)
+        if not name and not normalized_code:
+            continue
+        value = code_to_value.get(normalized_code, 0.0)
+        if normalized_code and normalized_code not in code_to_value:
+            warnings.append(f"asset_distribution 代码未匹配持仓市值: {code_raw} (列 {col_idx + 1})")
+        columns.append((col_idx, name, normalized_code, value))
+
+    stock_component_by_code: Dict[str, float] = {}
+    total_stock_component_value = 0.0
+    for col_idx, _, normalized_code, market_value in columns:
+        stock_weight_sum = 0.0
+        for raw_row in rows[2:]:
+            if not raw_row:
+                continue
+            asset_name = raw_row[0].strip() if len(raw_row) > 0 else ""
+            if asset_name not in STOCK_ASSET_TYPES:
+                continue
+            pct_text = raw_row[col_idx] if col_idx < len(raw_row) else ""
+            try:
+                weight = _parse_percent_cell(pct_text)
+            except ValueError:
+                raise ValueError(
+                    f"asset_distribution 无法解析百分比: 资产类型={asset_name}, 列={col_idx + 1}, 值='{pct_text}'"
+                )
+            stock_weight_sum += weight
+
+        stock_component_value = round6(market_value * stock_weight_sum)
+        if normalized_code:
+            for key in _holding_lookup_codes(normalized_code):
+                stock_component_by_code[key] = stock_component_value
+            stock_component_by_code[normalized_code] = stock_component_value
+        total_stock_component_value += stock_component_value
+
+    return stock_component_by_code, round6(total_stock_component_value), warnings
+
+
+def compute_stock_industry_distribution_values(
+    stock_industry_distribution_csv: Path,
+    stock_component_by_code: Dict[str, float],
+) -> Tuple[List[str], Dict[str, float], List[str]]:
+    rows, _ = read_csv_rows(stock_industry_distribution_csv)
+    if len(rows) < 3:
+        raise ValueError(f"stock industry distribution csv invalid: {stock_industry_distribution_csv}")
+
+    name_row = rows[0]
+    code_row = rows[1] if len(rows) > 1 else []
+    max_cols = max(len(name_row), len(code_row))
+
+    columns: List[Tuple[int, str, str, float]] = []
+    warnings: List[str] = []
+    for col_idx in range(1, max_cols):
+        name = name_row[col_idx].strip() if col_idx < len(name_row) else ""
+        code_raw = code_row[col_idx].strip() if col_idx < len(code_row) else ""
+        normalized_code = _normalize_distribution_code(code_raw)
+        if not name and not normalized_code:
+            continue
+        stock_component_value = stock_component_by_code.get(normalized_code, 0.0)
+        if normalized_code and normalized_code not in stock_component_by_code:
+            warnings.append(f"stock_industry_distribution 代码未匹配股票成分市值: {code_raw} (列 {col_idx + 1})")
+        columns.append((col_idx, name, normalized_code, stock_component_value))
+
+    industry_names: List[str] = []
+    industry_value_sums: Dict[str, float] = {}
+    for raw_row in rows[2:]:
+        if not raw_row:
+            continue
+        industry_name = raw_row[0].strip() if len(raw_row) > 0 else ""
+        if not industry_name:
+            continue
+        if industry_name in {"总计", "合计", "total", "TOTAL"}:
+            continue
+        total_value = 0.0
+        for col_idx, _, _, stock_component_value in columns:
+            pct_text = raw_row[col_idx] if col_idx < len(raw_row) else ""
+            try:
+                weight = _parse_percent_cell(pct_text)
+            except ValueError:
+                raise ValueError(
+                    "stock_industry_distribution 无法解析百分比: "
+                    f"行业={industry_name}, 列={col_idx + 1}, 值='{pct_text}'"
+                )
+            total_value += stock_component_value * weight
+        industry_names.append(industry_name)
+        industry_value_sums[industry_name] = round6(total_value)
+
+    return industry_names, industry_value_sums, warnings
+
+
+def _stock_industry_value_col(industry_name: str) -> str:
+    return f"{industry_name}市值"
+
+
+def _stock_industry_ratio_col(industry_name: str) -> str:
+    return f"{industry_name}仓位"
+
+
+def build_stock_industry_distribution_ratio_header(industry_names: List[str]) -> List[str]:
+    header = [COL_DATE, COL_STOCK_COMPONENT_TOTAL]
+    for name in industry_names:
+        header.append(_stock_industry_value_col(name))
+        header.append(_stock_industry_ratio_col(name))
+    return header
+
+
+def _normalize_existing_stock_industry_distribution_ratio_rows(
+    rows: List[List[str]],
+    header: List[str],
+) -> Dict[str, Dict[str, object]]:
+    if not rows:
+        return {}
+
+    existing_header = [cell.strip() for cell in rows[0]]
+    base_alias = {"date": COL_DATE, "stock_component_total": COL_STOCK_COMPONENT_TOTAL}
+    date_idx = find_header_index(existing_header, [COL_DATE, "date"])
+    if date_idx < 0:
+        return {}
+
+    records: Dict[str, Dict[str, object]] = {}
+    header_set = set(header)
+    value_cols = {col for col in header if col.endswith("市值")} | {COL_STOCK_COMPONENT_TOTAL}
+    ratio_cols = {col for col in header if col.endswith("仓位")}
+
+    for row in rows[1:]:
+        if not any(cell.strip() for cell in row):
+            continue
+        date_text = row[date_idx].strip() if date_idx < len(row) else ""
+        if not date_text:
+            continue
+
+        record: Dict[str, object] = {col: "" for col in header}
+        record[COL_DATE] = date_text
+
+        for idx, raw_col_name in enumerate(existing_header):
+            col_name = base_alias.get(raw_col_name, raw_col_name)
+            if col_name not in header_set:
+                continue
+            if idx >= len(row):
+                continue
+            cell = row[idx].strip()
+            if not cell:
+                continue
+            if col_name == COL_DATE:
+                record[COL_DATE] = cell
+                continue
+            if col_name in value_cols:
+                record[col_name] = round1(parse_number(cell))
+            elif col_name in ratio_cols:
+                record[col_name] = round_asset_ratio(parse_number(cell))
+
+        records[date_text] = record
+
+    return records
+
+
+def upsert_stock_industry_distribution_ratio_history(
+    stock_industry_distribution_ratio_csv: Path,
+    date_text: str,
+    stock_component_total: float,
+    industry_names: List[str],
+    industry_value_sums: Dict[str, float],
+) -> None:
+    header = build_stock_industry_distribution_ratio_header(industry_names)
+    records: Dict[str, Dict[str, object]] = {}
+    if stock_industry_distribution_ratio_csv.exists():
+        rows, _ = read_csv_rows(stock_industry_distribution_ratio_csv)
+        records = _normalize_existing_stock_industry_distribution_ratio_rows(rows, header)
+
+    record: Dict[str, object] = records.get(date_text, {col: "" for col in header})
+    record[COL_DATE] = date_text
+    record[COL_STOCK_COMPONENT_TOTAL] = round1(stock_component_total)
+
+    for name in industry_names:
+        value_col = _stock_industry_value_col(name)
+        ratio_col = _stock_industry_ratio_col(name)
+        raw_value = float(industry_value_sums.get(name, 0.0))
+        value = round1(raw_value)
+        ratio = round_asset_ratio(raw_value / stock_component_total) if stock_component_total > 0 else 0.0
+        if ratio == -0.0:
+            ratio = 0.0
+        record[value_col] = value
+        record[ratio_col] = ratio
+
+    records[date_text] = record
+
+    sorted_dates = sorted(records.keys(), key=_parse_date_sort_key)
+    output_rows: List[List[object]] = [header]
+    for date_key in sorted_dates:
+        row_record = records[date_key]
+        output_rows.append([row_record.get(col, "") for col in header])
+
+    write_csv_rows(stock_industry_distribution_ratio_csv, output_rows)
 
 
 class PriceFetcher:
@@ -1710,12 +2001,11 @@ class PriceFetcher:
         self,
         target_code: str,
         quote_url: str,
-        product_variable: str,
+        is_fund: bool,
     ) -> List[str]:
         symbols: List[str] = []
 
         code_text = target_code.strip().lower()
-        product = normalize_code(product_variable)
 
         digits = ""
         match_with_prefix = re.fullmatch(r"(sh|sz|jj)(\d{6})", code_text)
@@ -1724,8 +2014,8 @@ class PriceFetcher:
         elif re.fullmatch(r"\d{6}", code_text):
             digits = code_text
 
-        # For active funds(product=3), prioritize NAV-style symbol `jj`.
-        if product == "3" and digits:
+        # For active funds, prioritize NAV-style symbol `jj`.
+        if is_fund and digits:
             symbols.append(f"jj{digits}")
 
         from_url = self._extract_tencent_symbol_from_url(quote_url)
@@ -1734,10 +2024,10 @@ class PriceFetcher:
 
         if match_with_prefix:
             symbols.append(code_text)
-            if product == "3":
+            if is_fund:
                 symbols.extend([f"sz{digits}", f"sh{digits}"])
         elif digits:
-            if product == "3":
+            if is_fund:
                 symbols.extend([f"sz{digits}", f"sh{digits}"])
             elif digits.startswith(("5", "6", "9")):
                 symbols.extend([f"sh{digits}", f"sz{digits}"])
@@ -1756,10 +2046,8 @@ class PriceFetcher:
     def _pick_tencent_price_from_parts(
         self,
         parts: List[str],
-        product_variable: str,
+        is_fund: bool,
     ) -> float | None:
-        product = normalize_code(product_variable)
-
         for index in (3, 4, 5):
             if index >= len(parts):
                 continue
@@ -1769,7 +2057,7 @@ class PriceFetcher:
                 continue
             if candidate <= 0:
                 continue
-            if product == "3" and candidate > 1000:
+            if is_fund and candidate > 1000:
                 continue
             return candidate
 
@@ -1780,7 +2068,7 @@ class PriceFetcher:
                 continue
             if not (0.0001 <= candidate <= 100000):
                 continue
-            if product == "3" and candidate > 1000:
+            if is_fund and candidate > 1000:
                 continue
             return candidate
         return None
@@ -1788,13 +2076,12 @@ class PriceFetcher:
     def _fetch_tencent_quote_by_symbol(
         self,
         symbol: str,
-        product_variable: str,
+        is_fund: bool,
     ) -> Tuple[float | None, str]:
         if not symbol:
             return None, "empty-symbol"
         try:
-            product = normalize_code(product_variable)
-            if product == "3" and not symbol.startswith("jj"):
+            if is_fund and not symbol.startswith("jj"):
                 return None, "skip-non-jj-for-fund-nav"
 
             api_url = f"https://qt.gtimg.cn/q={symbol}"
@@ -1805,7 +2092,7 @@ class PriceFetcher:
             if not payload_match:
                 return None, "no-payload"
             parts = payload_match.group(1).split("~")
-            picked = self._pick_tencent_price_from_parts(parts, product_variable)
+            picked = self._pick_tencent_price_from_parts(parts, is_fund)
             if picked is None:
                 return None, "no-valid-price"
             return picked, ""
@@ -1816,29 +2103,49 @@ class PriceFetcher:
         self,
         quote_url: str,
         target_code: str,
-        product_variable: str,
+        is_fund: bool,
     ) -> Tuple[float | None, str, str]:
-        symbols = self._build_tencent_symbols(target_code, quote_url, product_variable)
+        symbols = self._build_tencent_symbols(target_code, quote_url, is_fund)
         errors: List[str] = []
         for symbol in symbols:
-            price, error = self._fetch_tencent_quote_by_symbol(symbol, product_variable)
+            price, error = self._fetch_tencent_quote_by_symbol(symbol, is_fund)
             if price is not None:
                 return price, symbol, ""
             if error:
                 errors.append(f"{symbol}:{error}")
         return None, "", "; ".join(errors)
 
+    def _infer_is_fund(self, target_name: str, target_code: str, quote_url: str) -> bool:
+        url_text = quote_url.strip().lower()
+        if re.search(r"gu\.qq\.com/jj\d{6}", url_text):
+            return True
+
+        name = target_name.strip()
+        if "ETF" in name.upper():
+            return False
+
+        fund_keywords = ("基金", "混合", "债", "QDII", "FOF")
+        if any(keyword in name for keyword in fund_keywords):
+            return True
+
+        normalized = normalize_target_code(target_code)
+        digits = extract_target_digits(normalized)
+        if digits and digits.startswith(("0", "1", "2")) and any(keyword in name for keyword in ("股票", "指数")):
+            return True
+        return False
+
     def fetch_price(
         self,
         quote_url: str,
+        target_name: str = "",
         target_code: str = "",
-        product_variable: str = "",
     ) -> Tuple[float, str]:
+        is_fund = self._infer_is_fund(target_name, target_code, quote_url)
         # Tencent URL mode: prefer direct quote endpoint; avoid relying on page HTML rendering.
         tencent_price, tencent_symbol, tencent_debug = self._fetch_tencent_quote_from_url_or_code(
             quote_url,
             target_code,
-            product_variable,
+            is_fund,
         )
         if tencent_price is not None:
             return tencent_price, f"{tencent_price} (tencent-api:{tencent_symbol})"
@@ -1855,7 +2162,7 @@ class PriceFetcher:
         except Exception as exc:
             raise ValueError(f"{exc}{tencent_note}") from exc
         body_text = " ".join(re.findall(r"[\u4e00-\u9fffA-Za-z0-9\.\-_%]+", raw_html))
-        picked = extract_price_from_html_text(raw_html, body_text, product_variable)
+        picked = extract_price_from_html_text(raw_html, body_text, is_fund)
         if picked is not None:
             return picked, f"{picked} (url-content-fallback)"
 
@@ -1866,14 +2173,14 @@ def generate_daily_data(
     holdings_csv: Path,
     current_cash_csv: Path,
     cashflows_csv: Path,
+    asset_distribution_csv: Path,
+    stock_industry_distribution_csv: Path,
     trading_calendar_csv: Path,
     return_history_csv: Path,
     xirr_history_csv: Path,
     nav_history_csv: Path,
-    configuration_ratio_csv: Path,
-    product_ref_csv: Path,
-    assets_ref_csv: Path,
-    industry_ref_csv: Path,
+    asset_distribution_ratio_csv: Path,
+    stock_industry_distribution_ratio_csv: Path,
     output_csv: Path,
     archive_dir: Path | None,
     timeout: float,
@@ -1884,6 +2191,7 @@ def generate_daily_data(
     cos_prefix: str,
     cos_fail_on_error: bool,
     non_trading_debug_no_write: bool,
+    non_trading_force_write: bool,
 ) -> int:
     today_date = dt.date.today()
     today = today_date.isoformat()
@@ -1911,12 +2219,15 @@ def generate_daily_data(
     if today_date not in trading_calendar:
         raise ValueError(f"trading calendar missing date {today}: {trading_calendar_csv}")
     is_trading_day = bool(trading_calendar[today_date])
-    if not is_trading_day and not non_trading_debug_no_write:
-        print(f"Skip: {today} is not an A-share trading day.")
-        return 0
-    debug_no_write_mode = (not is_trading_day and non_trading_debug_no_write)
-    if debug_no_write_mode:
-        print(f"Debug mode: {today} is non-trading day, run calculations without persisting CSV/history.")
+    if not is_trading_day:
+        if non_trading_force_write:
+            print(f"Debug force-write mode: {today} is non-trading day, but persistence is enabled.")
+        elif non_trading_debug_no_write:
+            print(f"Debug mode: {today} is non-trading day, run calculations without persisting CSV/history.")
+        else:
+            print(f"Skip: {today} is not an A-share trading day.")
+            return 0
+    debug_no_write_mode = (not is_trading_day and non_trading_debug_no_write and not non_trading_force_write)
 
     previous_trading_day = find_previous_trading_day(today_date, trading_calendar)
     if previous_trading_day is not None:
@@ -1924,7 +2235,8 @@ def generate_daily_data(
             "return_history": return_history_csv,
             "xirr_history": xirr_history_csv,
             "nav_history": nav_history_csv,
-            "configuration_ratio": configuration_ratio_csv,
+            "asset_distribution_ratio": asset_distribution_ratio_csv,
+            "stock_industry_distribution_ratio": stock_industry_distribution_ratio_csv,
         }
         missing_previous_day_rows = find_missing_previous_day_records(previous_trading_day, history_paths)
         if missing_previous_day_rows:
@@ -1944,11 +2256,7 @@ def generate_daily_data(
     cost_total = compute_cost_total(cashflow_entries)
     daily_net_flow = compute_daily_net_flow(cashflow_entries, today_date)
     cashflow_count = len(cashflow_entries)
-    product_map = load_variable_mapping(product_ref_csv)
-    assets_map = load_variable_mapping(assets_ref_csv)
-    industry_map = load_variable_mapping(industry_ref_csv)
-    asset_codes = sort_asset_codes(assets_map)
-    assets_value_sums: Dict[str, float] = {code: 0.0 for code in asset_codes}
+    holding_values_for_distribution: Dict[str, float] = {}
 
     fetcher = PriceFetcher(timeout=timeout)
 
@@ -1963,12 +2271,6 @@ def generate_daily_data(
         "盈亏",
         "收益率",
         "现价查询链接",
-        "产品类型编码",
-        "产品类型",
-        "大类资产编码",
-        "大类资产",
-        "行业编码",
-        "行业",
         "抓取状态",
         "抓取备注",
     ]
@@ -1979,13 +2281,6 @@ def generate_daily_data(
     total_value = 0.0
 
     for holding in holdings:
-        product_code = normalize_code(holding.product_variable)
-        assets_code = normalize_code(holding.assets_variable)
-        industry_code = normalize_code(holding.industry_variable)
-        product_name = product_map.get(product_code, "")
-        assets_name = assets_map.get(assets_code, "")
-        industry_name = industry_map.get(industry_code, "")
-
         target_price_text = ""
         target_price_val: float | None = None
         target_value: float | None = None
@@ -2000,16 +2295,15 @@ def generate_daily_data(
             target_cost = round6(float(holding.target_cost_raw))
             target_price_val, target_price_text = fetcher.fetch_price(
                 holding.quote_url,
+                holding.target_name,
                 holding.target_code,
-                holding.product_variable,
             )
             target_price_val = round6(target_price_val)
             target_value = round6(target_amount * target_price_val)
             target_pnl = round6(target_value - target_cost)
             target_return_rate = round_rate(target_value / target_cost - 1.0) if target_cost else None
             total_value += target_value
-            if assets_code in assets_value_sums:
-                assets_value_sums[assets_code] += target_value
+            holding_values_for_distribution[holding.target_code] = target_value
             success_count += 1
         except Exception as exc:
             fetch_status = "error"
@@ -2030,20 +2324,12 @@ def generate_daily_data(
                 target_pnl if target_pnl is not None else "",
                 target_return_rate if target_return_rate is not None else "",
                 holding.quote_url,
-                product_code,
-                product_name,
-                assets_code,
-                assets_name,
-                industry_code,
-                industry_name,
                 fetch_status,
                 target_price_text if fetch_status == "ok" else fetch_note,
             ]
         )
 
     # Add synthetic cash_total row from current_cash.csv.
-    cash_assets_code = "9"
-    cash_assets_name = assets_map.get(cash_assets_code, "现金")
     output_rows.append(
         [
             today,
@@ -2056,19 +2342,11 @@ def generate_daily_data(
             0,
             0,
             "",
-            "",
-            "现金",
-            cash_assets_code,
-            cash_assets_name,
-            "",
-            "",
             "ok",
             f"cash_accounts={len(cash_rows)}",
         ]
     )
     total_value += cash_total
-    if cash_assets_code in assets_value_sums:
-        assets_value_sums[cash_assets_code] += cash_total
 
     has_total_data = success_count > 0 or cash_total > 0 or cost_total > 0
     total_cost_rounded = cost_total if has_total_data else ""
@@ -2089,12 +2367,6 @@ def generate_daily_data(
             total_value_rounded,
             total_pnl_rounded,
             total_return_rate_rounded,
-            "",
-            "",
-            "",
-            "",
-            "",
-            "",
             "",
             "summary",
             (
@@ -2134,13 +2406,39 @@ def generate_daily_data(
                 daily_net_flow=round6(daily_net_flow),
                 benchmark_points=benchmark_points,
             )
-            upsert_configuration_ratio_history(
-                configuration_ratio_csv=configuration_ratio_csv,
+            asset_names, asset_value_sums, distribution_warnings = compute_asset_distribution_values(
+                asset_distribution_csv=asset_distribution_csv,
+                holding_values=holding_values_for_distribution,
+                cash_total=cash_total,
+            )
+            for warning in distribution_warnings:
+                print(f"Warning: {warning}")
+            upsert_asset_distribution_ratio_history(
+                asset_distribution_ratio_csv=asset_distribution_ratio_csv,
                 date_text=today,
                 assets_total=assets_total_rounded,
-                assets_value_sums=assets_value_sums,
-                asset_codes=asset_codes,
-                assets_map=assets_map,
+                asset_names=asset_names,
+                asset_value_sums=asset_value_sums,
+            )
+            stock_component_by_code, stock_component_total, stock_component_warnings = compute_stock_component_values(
+                asset_distribution_csv=asset_distribution_csv,
+                holding_values=holding_values_for_distribution,
+                cash_total=cash_total,
+            )
+            for warning in stock_component_warnings:
+                print(f"Warning: {warning}")
+            industry_names, industry_value_sums, industry_warnings = compute_stock_industry_distribution_values(
+                stock_industry_distribution_csv=stock_industry_distribution_csv,
+                stock_component_by_code=stock_component_by_code,
+            )
+            for warning in industry_warnings:
+                print(f"Warning: {warning}")
+            upsert_stock_industry_distribution_ratio_history(
+                stock_industry_distribution_ratio_csv=stock_industry_distribution_ratio_csv,
+                date_text=today,
+                stock_component_total=stock_component_total,
+                industry_names=industry_names,
+                industry_value_sums=industry_value_sums,
             )
 
         if archive_dir is not None:
@@ -2207,6 +2505,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to cashflows.csv",
     )
     parser.add_argument(
+        "--asset-distribution",
+        type=Path,
+        default=Path("data/input/asset_distribution.csv"),
+        help="Path to asset_distribution.csv",
+    )
+    parser.add_argument(
+        "--stock-industry-distribution",
+        type=Path,
+        default=Path("data/input/stock_industry_distribution.csv"),
+        help="Path to stock_industry_distribution.csv",
+    )
+    parser.add_argument(
         "--trading-calendar",
         type=Path,
         default=Path("data/reference/trading_calendar.csv"),
@@ -2231,28 +2541,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to nav_history.csv",
     )
     parser.add_argument(
-        "--configuration-ratio",
+        "--asset-distribution-ratio",
         type=Path,
-        default=Path("data/output/configuration_ratio.csv"),
-        help="Path to configuration_ratio.csv",
+        default=Path("data/output/asset_distribution_ratio.csv"),
+        help="Path to asset_distribution_ratio.csv",
     )
     parser.add_argument(
-        "--product-ref",
+        "--stock-industry-distribution-ratio",
         type=Path,
-        default=Path("data/reference/product_variable.csv"),
-        help="Path to product_variable.csv",
-    )
-    parser.add_argument(
-        "--assets-ref",
-        type=Path,
-        default=Path("data/reference/assets_variable.csv"),
-        help="Path to assets_variable.csv",
-    )
-    parser.add_argument(
-        "--industry-ref",
-        type=Path,
-        default=Path("data/reference/industry_variable.csv"),
-        help="Path to industry_variable.csv",
+        default=Path("data/output/stock_industry_distribution_ratio.csv"),
+        help="Path to stock_industry_distribution_ratio.csv",
     )
     parser.add_argument(
         "--output",
@@ -2347,6 +2645,15 @@ def build_parser() -> argparse.ArgumentParser:
             "or COS publish (default: false)."
         ),
     )
+    parser.add_argument(
+        "--non-trading-force-write",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Temporarily allow non-trading-day run to persist output/history/archive and COS publish "
+            "(default: false). Use only for debugging."
+        ),
+    )
     return parser
 
 
@@ -2370,14 +2677,14 @@ def run_python_engine(args: argparse.Namespace, archive_dir: Path | None) -> int
         holdings_csv=args.holdings,
         current_cash_csv=args.current_cash,
         cashflows_csv=args.cashflows,
+        asset_distribution_csv=args.asset_distribution,
+        stock_industry_distribution_csv=args.stock_industry_distribution,
         trading_calendar_csv=args.trading_calendar,
         return_history_csv=args.return_history,
         xirr_history_csv=args.xirr_history,
         nav_history_csv=args.nav_history,
-        configuration_ratio_csv=args.configuration_ratio,
-        product_ref_csv=args.product_ref,
-        assets_ref_csv=args.assets_ref,
-        industry_ref_csv=args.industry_ref,
+        asset_distribution_ratio_csv=args.asset_distribution_ratio,
+        stock_industry_distribution_ratio_csv=args.stock_industry_distribution_ratio,
         output_csv=args.output,
         archive_dir=archive_dir,
         timeout=args.timeout,
@@ -2388,6 +2695,7 @@ def run_python_engine(args: argparse.Namespace, archive_dir: Path | None) -> int
         cos_prefix=args.cos_prefix,
         cos_fail_on_error=args.cos_fail_on_error,
         non_trading_debug_no_write=args.non_trading_debug_no_write,
+        non_trading_force_write=args.non_trading_force_write,
     )
 
 
