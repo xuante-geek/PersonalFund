@@ -6,9 +6,9 @@
 2026-05-08,汇添富中证主要消费ETF,159928,40000.0,29880.0,0.734,29360.0,-520.0,-0.0174,https://gu.qq.com/sz159928,ok,0.734 (tencent-api:sz159928)
 2026-05-08,黄金ETF,518880,1000.0,10005.0,9.88,9880.0,-125.0,-0.0125,https://gu.qq.com/sh518880,ok,9.88 (tencent-api:sh518880)
 2026-05-08,信澳新能源产业股票,001410,13959.13,45888.0,6.562,91599.81106,45711.81106,0.9962,https://gu.qq.com/jj001410,ok,6.562 (tencent-api:jj001410)
-2026-05-08,兴全合宜混合,163417,30676.56,40400.0,2.2296,68396.458176,27996.458176,0.693,https://gu.qq.com/sz163417,ok,2.2296 (tencent-api:jj163417)
+2026-05-08,兴全合宜混合,163417,30676.56,40400.0,2.2152,67954.715712,27554.715712,0.682,https://gu.qq.com/sz163417,ok,2.2152 (tencent-api:jj163417)
 2026-05-08,易方达亚洲精选股票,118001,29124.5,33380.0,1.714,49919.393,16539.393,0.4955,https://gu.qq.com/jj118001,ok,1.714 (tencent-api:jj118001)
 2026-05-08,工银前沿医疗股票,001717,20298.5,61634.0,3.058,62072.813,438.813,0.0071,https://gu.qq.com/jj001717,ok,3.058 (tencent-api:jj001717)
-2026-05-08,易方达蓝筹精选混合,005827,29782.0,54385.0,1.7347,51662.8354,-2722.1646,-0.0501,https://gu.qq.com/jj005827,ok,1.7347 (tencent-api:jj005827)
+2026-05-08,易方达蓝筹精选混合,005827,29782.0,54385.0,1.7176,51153.5632,-3231.4368,-0.0594,https://gu.qq.com/jj005827,ok,1.7176 (tencent-api:jj005827)
 2026-05-08,cash_total,CASH,1,40273.0,1,40273.0,0,0,,ok,cash_accounts=2
-2026-05-08,__TOTAL__,,,430000.0,,534888.910636,104888.910636,0.2439,,summary,holdings_encoding=utf-8-sig; cash_encoding=utf-8-sig; cashflows_encoding=utf-8-sig; cash_total=40273.0; cost_total=430000.0; daily_net_flow=0.0; cashflow_count=2; success=11; error=0
+2026-05-08,__TOTAL__,,,430000.0,,533937.895972,103937.895972,0.2417,,summary,holdings_encoding=utf-8-sig; cash_encoding=utf-8-sig; cashflows_encoding=utf-8-sig; cash_total=40273.0; cost_total=430000.0; daily_net_flow=0.0; cashflow_count=2; success=11; error=0

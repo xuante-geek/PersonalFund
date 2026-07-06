@@ -1083,20 +1083,42 @@ def _xnpv(rate: float, cashflows: List[Tuple[dt.date, float]]) -> float:
     return result
 
 
+def build_xirr_cashflows(
+    cashflow_entries: List[CashflowEntry],
+    valuation_date: dt.date,
+    assets_total: float,
+    base_assets_total: float,
+) -> List[Tuple[dt.date, float]]:
+    if valuation_date < BENCHMARK_BASE_DATE:
+        return []
+
+    cashflows: List[Tuple[dt.date, float]] = [(BENCHMARK_BASE_DATE, -round6(base_assets_total))]
+    cashflows.extend(
+        (entry.date_value, entry.amount)
+        for entry in cashflow_entries
+        if BENCHMARK_BASE_DATE < entry.date_value <= valuation_date and entry.amount != 0
+    )
+    cashflows.append((valuation_date, assets_total))
+    return cashflows
+
+
 def compute_xirr(
     cashflow_entries: List[CashflowEntry],
     valuation_date: dt.date,
     assets_total: float,
+    base_assets_total: float,
 ) -> float | None:
     if assets_total <= 0:
         return None
 
-    cashflows: List[Tuple[dt.date, float]] = [
-        (entry.date_value, entry.amount)
-        for entry in cashflow_entries
-        if entry.date_value <= valuation_date and entry.amount != 0
-    ]
-    cashflows.append((valuation_date, assets_total))
+    cashflows = build_xirr_cashflows(
+        cashflow_entries=cashflow_entries,
+        valuation_date=valuation_date,
+        assets_total=assets_total,
+        base_assets_total=base_assets_total,
+    )
+    if not cashflows:
+        return None
 
     min_date = min(flow_date for flow_date, _ in cashflows)
     max_date = max(flow_date for flow_date, _ in cashflows)
@@ -1222,6 +1244,35 @@ def upsert_return_history(
         output_rows.append(records[date_key])
 
     write_csv_rows(return_history_csv, output_rows)
+
+
+def load_base_assets_total(*csv_paths: Path) -> float | None:
+    base_date_text = BENCHMARK_BASE_DATE.isoformat()
+    for csv_path in csv_paths:
+        if not csv_path.exists():
+            continue
+        rows, _ = read_csv_rows(csv_path)
+        if not rows:
+            continue
+        header = [cell.strip() for cell in rows[0]]
+        date_idx = find_header_index(header, [COL_DATE, "date"])
+        assets_idx = find_header_index(header, [COL_ASSETS_TOTAL, "assets_total"])
+        if date_idx < 0 or assets_idx < 0:
+            continue
+        for row in rows[1:]:
+            if date_idx >= len(row) or assets_idx >= len(row):
+                continue
+            date_text = row[date_idx].strip()
+            if not date_text:
+                continue
+            try:
+                if parse_flexible_date(date_text).isoformat() != base_date_text:
+                    continue
+            except ValueError:
+                continue
+            if row[assets_idx].strip():
+                return round6(parse_number(row[assets_idx]))
+    return None
 
 
 def _normalize_existing_xirr_history_rows(rows: List[List[str]]) -> Dict[str, List[object]]:
@@ -2391,7 +2442,20 @@ def generate_daily_data(
                 assets_total=assets_total_rounded,
                 cost_total=round6(cost_total),
             )
-            xirr_value = compute_xirr(cashflow_entries, today_date, assets_total_rounded)
+            base_assets_total = load_base_assets_total(xirr_history_csv, return_history_csv)
+            if base_assets_total is None:
+                if today_date == BENCHMARK_BASE_DATE:
+                    base_assets_total = assets_total_rounded
+                else:
+                    raise ValueError(
+                        f"Cannot compute XIRR: missing base assets_total for {BENCHMARK_BASE_DATE.isoformat()}"
+                    )
+            xirr_value = compute_xirr(
+                cashflow_entries,
+                today_date,
+                assets_total_rounded,
+                base_assets_total,
+            )
             upsert_xirr_history(
                 xirr_history_csv=xirr_history_csv,
                 date_text=today,
