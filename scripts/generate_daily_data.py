@@ -2098,7 +2098,34 @@ class PriceFetcher:
         self,
         parts: List[str],
         is_fund: bool,
+        symbol: str,
     ) -> float | None:
+        # Tencent's exchange quote payload exposes the latest LOF unit NAV at
+        # field 81. Field 3 is the exchange price, not the fund unit NAV.
+        if is_fund and symbol.startswith(("sz", "sh")) and len(parts) > 81:
+            try:
+                unit_nav = float(parts[81])
+            except (TypeError, ValueError):
+                unit_nav = 0.0
+            if 0.0001 <= unit_nav <= 1000:
+                return unit_nav
+            return None
+
+        # The jj payload uses field 5 for unit NAV and field 6 for cumulative
+        # NAV. Never scan adjacent fields for funds because that can silently
+        # substitute cumulative NAV.
+        if is_fund and symbol.startswith("jj"):
+            if len(parts) <= 5:
+                return None
+            try:
+                unit_nav = float(parts[5])
+            except (TypeError, ValueError):
+                return None
+            return unit_nav if 0.0001 <= unit_nav <= 1000 else None
+
+        if is_fund:
+            return None
+
         for index in (3, 4, 5):
             if index >= len(parts):
                 continue
@@ -2132,9 +2159,6 @@ class PriceFetcher:
         if not symbol:
             return None, "empty-symbol"
         try:
-            if is_fund and not symbol.startswith("jj"):
-                return None, "skip-non-jj-for-fund-nav"
-
             api_url = f"https://qt.gtimg.cn/q={symbol}"
             resp = self.session.get(api_url, timeout=self.timeout)
             resp.raise_for_status()
@@ -2143,7 +2167,7 @@ class PriceFetcher:
             if not payload_match:
                 return None, "no-payload"
             parts = payload_match.group(1).split("~")
-            picked = self._pick_tencent_price_from_parts(parts, is_fund)
+            picked = self._pick_tencent_price_from_parts(parts, is_fund, symbol)
             if picked is None:
                 return None, "no-valid-price"
             return picked, ""
@@ -2157,6 +2181,10 @@ class PriceFetcher:
         is_fund: bool,
     ) -> Tuple[float | None, str, str]:
         symbols = self._build_tencent_symbols(target_code, quote_url, is_fund)
+        if is_fund:
+            from_url = self._extract_tencent_symbol_from_url(quote_url)
+            if from_url.startswith(("sz", "sh")):
+                symbols = [from_url] + [symbol for symbol in symbols if symbol != from_url]
         errors: List[str] = []
         for symbol in symbols:
             price, error = self._fetch_tencent_quote_by_symbol(symbol, is_fund)
